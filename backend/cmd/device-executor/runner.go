@@ -1,0 +1,418 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"sync"
+
+	"github.com/pengmide/lumi/internal/agent"
+	"github.com/pengmide/lumi/internal/agentmode"
+	"github.com/pengmide/lumi/internal/config"
+	"github.com/pengmide/lumi/internal/jsonrpc"
+)
+
+type Runner struct {
+	cfg    *ExecutorConfig
+	client *Client
+
+	mu          sync.Mutex
+	agents      map[string]*agent.Process
+	initialized map[string]bool
+	sessions    map[string]string
+	currentTask *runningTask
+}
+
+type runningTask struct {
+	TaskID    string
+	AgentID   string
+	SessionID string
+	Process   *agent.Process
+}
+
+func NewRunner(cfg *ExecutorConfig, client *Client) *Runner {
+	return &Runner{
+		cfg:         cfg,
+		client:      client,
+		agents:      make(map[string]*agent.Process),
+		initialized: make(map[string]bool),
+		sessions:    make(map[string]string),
+	}
+}
+
+func (r *Runner) Execute(ctx context.Context, env Envelope) {
+	payload, err := decodePayload[TaskExecutePayload](env)
+	if err != nil {
+		r.sendTaskError(env.TaskID, fmt.Sprintf("invalid task.execute payload: %v", err))
+		return
+	}
+	if !r.client.SetupReady() {
+		r.sendTaskError(env.TaskID, "Device setup is not ready")
+		return
+	}
+
+	claimed, proc, err := r.beginTask(env.TaskID, payload.AgentID, payload.WorkspacePath)
+	if err != nil {
+		r.sendTaskError(env.TaskID, err.Error())
+		return
+	}
+	if !claimed {
+		r.sendTaskError(env.TaskID, "Device is busy")
+		return
+	}
+	defer r.finishTask(env.TaskID)
+
+	cleanupNotification := proc.OnNotification(func(msg *jsonrpc.Message) {
+		if err := r.client.Send(MsgTaskEvent, env.TaskID, TaskEventPayload{
+			SessionID:    r.sessionForTask(env.TaskID),
+			Notification: toACPNotification(msg),
+		}); err != nil {
+			log.Printf("failed to forward notification for task %s: %v", env.TaskID, err)
+		}
+	})
+	defer cleanupNotification()
+
+	cleanupPermission := proc.OnPermission(func(req *agent.PermissionRequest) {
+		if err := r.client.Send(MsgPermissionRequest, env.TaskID, toPermissionRequestPayload(req)); err != nil {
+			log.Printf("failed to forward permission request for task %s: %v", env.TaskID, err)
+		}
+	})
+	defer cleanupPermission()
+
+	sessionID := payload.SessionID
+	if sessionID == "" {
+		cwd := payload.WorkspacePath
+		if cwd == "" {
+			cwd = r.cfg.Workspace
+		}
+
+		agentCfg := findAgentConfig(r.cfg, payload.AgentID)
+		backend := agentmode.BackendUnknown
+		sessionMode := agentmode.ModeDefault
+		if agentCfg != nil {
+			backend = agentmode.DetectBackend(agentCfg.ID, agentCfg.Command, agentCfg.Args)
+			sessionMode = agentmode.ResolveSessionMode(backend, agentCfg.SessionMode, agentCfg.PermissionMode)
+			if err := agentmode.PrepareSessionMode(backend, sessionMode); err != nil {
+				r.sendTaskError(env.TaskID, fmt.Sprintf("failed to prepare agent mode: %v", err))
+				return
+			}
+		}
+
+		resp, err := proc.Request("session/new", map[string]any{
+			"cwd":        cwd,
+			"mcpServers": []any{},
+		})
+		if err != nil {
+			r.sendTaskError(env.TaskID, err.Error())
+			return
+		}
+
+		var result struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := resp.ParseResult(&result); err != nil {
+			r.sendTaskError(env.TaskID, fmt.Sprintf("failed to parse session/new result: %v", err))
+			return
+		}
+		if result.SessionID == "" {
+			r.sendTaskError(env.TaskID, "session/new returned empty sessionId")
+			return
+		}
+		sessionID = result.SessionID
+
+		r.setSessionForTask(env.TaskID, sessionID)
+		if err := r.client.Send(MsgTaskSession, env.TaskID, TaskSessionPayload{SessionID: sessionID}); err != nil {
+			r.sendTaskError(env.TaskID, err.Error())
+			return
+		}
+
+		if agentmode.ShouldSetACPMode(backend, sessionMode) {
+			if _, err := proc.Request("session/set_mode", map[string]any{
+				"sessionId": sessionID,
+				"modeId":    sessionMode,
+			}); err != nil {
+				r.sendTaskError(env.TaskID, fmt.Sprintf("failed to set session mode: %v", err))
+				return
+			}
+		}
+	} else {
+		r.setSessionForTask(env.TaskID, sessionID)
+		if err := r.client.Send(MsgTaskSession, env.TaskID, TaskSessionPayload{SessionID: sessionID}); err != nil {
+			r.sendTaskError(env.TaskID, err.Error())
+			return
+		}
+	}
+
+	resp, err := proc.Request("session/prompt", map[string]any{
+		"sessionId": sessionID,
+		"prompt": []map[string]string{
+			{"type": "text", "text": payload.Prompt},
+		},
+	})
+	if err != nil {
+		r.sendTaskError(env.TaskID, err.Error())
+		return
+	}
+
+	if err := r.client.Send(MsgTaskDone, env.TaskID, TaskDonePayload{Result: resp.Result}); err != nil {
+		log.Printf("failed to send task.done for %s: %v", env.TaskID, err)
+	}
+}
+
+func (r *Runner) Cancel(_ context.Context, env Envelope) {
+	payload, err := decodePayload[TaskCancelPayload](env)
+	if err != nil {
+		log.Printf("invalid task.cancel payload: %v", err)
+		return
+	}
+
+	r.mu.Lock()
+	current := r.currentTask
+	r.mu.Unlock()
+	if current == nil || current.TaskID != env.TaskID || current.Process == nil {
+		return
+	}
+
+	sessionID := payload.SessionID
+	if sessionID == "" {
+		sessionID = r.sessionForTask(env.TaskID)
+	}
+	if sessionID == "" {
+		return
+	}
+
+	if err := current.Process.Notify("session/cancel", map[string]string{
+		"sessionId": sessionID,
+	}); err != nil {
+		log.Printf("failed to cancel task %s: %v", env.TaskID, err)
+	}
+}
+
+func (r *Runner) ConfirmPermission(_ context.Context, env Envelope) {
+	payload, err := decodePayload[PermissionConfirmPayload](env)
+	if err != nil {
+		log.Printf("invalid permission.confirm payload: %v", err)
+		return
+	}
+
+	r.mu.Lock()
+	current := r.currentTask
+	r.mu.Unlock()
+	if current == nil || current.TaskID != env.TaskID || current.Process == nil {
+		return
+	}
+
+	current.Process.ConfirmPermission(payload.ToolCallID, payload.OptionID)
+}
+
+func (r *Runner) RunningTaskIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.currentTask == nil {
+		return nil
+	}
+	return []string{r.currentTask.TaskID}
+}
+
+func (r *Runner) AbortCurrentTask(reason string) {
+	r.mu.Lock()
+	current := r.currentTask
+	if current == nil {
+		r.mu.Unlock()
+		return
+	}
+
+	delete(r.sessions, current.TaskID)
+	r.currentTask = nil
+	if current.AgentID != "" {
+		delete(r.agents, current.AgentID)
+		delete(r.initialized, current.AgentID)
+	}
+	r.mu.Unlock()
+
+	if current.Process == nil {
+		return
+	}
+	if current.SessionID != "" {
+		if err := current.Process.Notify("session/cancel", map[string]string{
+			"sessionId": current.SessionID,
+		}); err != nil {
+			log.Printf("failed to cancel task %s during %s: %v", current.TaskID, reason, err)
+		}
+	}
+	if err := current.Process.Stop(); err != nil {
+		log.Printf("failed to stop agent process for task %s during %s: %v", current.TaskID, reason, err)
+	}
+}
+
+func (r *Runner) Shutdown() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, proc := range r.agents {
+		if err := proc.Stop(); err != nil {
+			log.Printf("failed to stop agent %s: %v", proc.ID, err)
+		}
+	}
+}
+
+func (r *Runner) beginTask(taskID, agentID, workspacePath string) (bool, *agent.Process, error) {
+	proc, err := r.getOrStartAgent(agentID, workspacePath)
+	if err != nil {
+		return false, nil, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.currentTask != nil && r.currentTask.TaskID != taskID {
+		return false, nil, nil
+	}
+
+	r.currentTask = &runningTask{
+		TaskID:  taskID,
+		AgentID: agentID,
+		Process: proc,
+	}
+	if err := r.client.Send(MsgDeviceStatus, "", DeviceStatusPayload{Status: "busy"}); err != nil {
+		log.Printf("failed to send busy status: %v", err)
+	}
+	return true, proc, nil
+}
+
+func (r *Runner) finishTask(taskID string) {
+	r.mu.Lock()
+	delete(r.sessions, taskID)
+	if r.currentTask != nil && r.currentTask.TaskID == taskID {
+		r.currentTask = nil
+	}
+	hasRunningTask := r.currentTask != nil
+	r.mu.Unlock()
+
+	nextStatus := "setup_required"
+	if r.client.SetupReady() {
+		if hasRunningTask {
+			nextStatus = "busy"
+		} else {
+			nextStatus = "online"
+		}
+	}
+	if err := r.client.Send(MsgDeviceStatus, "", DeviceStatusPayload{Status: nextStatus}); err != nil {
+		log.Printf("failed to send device status: %v", err)
+	}
+}
+
+func (r *Runner) getOrStartAgent(agentID, workspacePath string) (*agent.Process, error) {
+	if agentID == "" {
+		agentID = r.cfg.DefaultAgent
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	proc, ok := r.agents[agentID]
+	if !ok {
+		agentCfg := findAgentConfig(r.cfg, agentID)
+		if agentCfg == nil {
+			return nil, fmt.Errorf("agent not found: %s", agentID)
+		}
+		proc = agent.NewProcess(agentCfg)
+		r.agents[agentID] = proc
+	}
+
+	if workspacePath == "" {
+		workspacePath = r.cfg.Workspace
+	}
+	proc.SetWorkingDir(workspacePath)
+	if err := proc.Start(); err != nil {
+		return nil, err
+	}
+	if !r.initialized[agentID] {
+		if _, err := proc.Request("initialize", map[string]any{
+			"protocolVersion": 1,
+			"clientCapabilities": map[string]any{
+				"fs": map[string]bool{"readTextFile": true, "writeTextFile": true},
+			},
+			"clientInfo": map[string]string{
+				"name":    "device-executor",
+				"version": "0.1.0",
+			},
+		}); err != nil {
+			return nil, err
+		}
+		r.initialized[agentID] = true
+	}
+
+	return proc, nil
+}
+
+func (r *Runner) setSessionForTask(taskID, sessionID string) {
+	r.mu.Lock()
+	r.sessions[taskID] = sessionID
+	if r.currentTask != nil && r.currentTask.TaskID == taskID {
+		r.currentTask.SessionID = sessionID
+	}
+	r.mu.Unlock()
+}
+
+func (r *Runner) sessionForTask(taskID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessions[taskID]
+}
+
+func (r *Runner) sendTaskError(taskID, message string) {
+	if err := r.client.Send(MsgTaskError, taskID, TaskErrorPayload{Message: message}); err != nil {
+		log.Printf("failed to send task.error for %s: %v", taskID, err)
+	}
+}
+
+func findAgentConfig(cfg *ExecutorConfig, agentID string) *config.AgentConfig {
+	for i := range cfg.Agents {
+		if cfg.Agents[i].ID == agentID {
+			return &cfg.Agents[i]
+		}
+	}
+	return nil
+}
+
+func toACPNotification(msg *jsonrpc.Message) ACPNotification {
+	params := json.RawMessage(nil)
+	if len(msg.Params) > 0 {
+		params = append(json.RawMessage(nil), msg.Params...)
+	}
+	return ACPNotification{
+		JSONRPC: msg.JSONRPC,
+		Method:  msg.Method,
+		Params:  params,
+	}
+}
+
+func toPermissionRequestPayload(req *agent.PermissionRequest) PermissionRequestPayload {
+	options := make([]PermissionOption, 0, len(req.Options))
+	for _, option := range req.Options {
+		options = append(options, PermissionOption{
+			OptionID: option.OptionID,
+			Name:     option.Name,
+			Kind:     option.Kind,
+		})
+	}
+
+	var rawInput json.RawMessage
+	if req.ToolCall.RawInput != nil {
+		if data, err := json.Marshal(req.ToolCall.RawInput); err == nil {
+			rawInput = data
+		}
+	}
+
+	return PermissionRequestPayload{
+		SessionID: req.SessionID,
+		Options:   options,
+		ToolCall: PermissionToolCall{
+			ToolCallID: req.ToolCall.ToolCallID,
+			RawInput:   rawInput,
+			Status:     req.ToolCall.Status,
+			Title:      req.ToolCall.Title,
+			Kind:       req.ToolCall.Kind,
+		},
+	}
+}

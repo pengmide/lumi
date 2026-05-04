@@ -1,0 +1,505 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/pengmide/lumi/internal/agent"
+	"github.com/pengmide/lumi/internal/agentmode"
+	"github.com/pengmide/lumi/internal/config"
+	"github.com/pengmide/lumi/internal/conversation"
+	"github.com/pengmide/lumi/internal/jsonrpc"
+	"github.com/pengmide/lumi/internal/storage"
+	"github.com/pengmide/lumi/internal/wechat"
+)
+
+type wechatChatRuntime struct {
+	config        *config.Config
+	agents        *agent.Manager
+	conversations *conversation.Manager
+
+	agentSessions map[string]map[string]string
+	initialized   map[string]bool
+	mu            sync.Mutex
+}
+
+func newWeChatChatRuntime(cfg *config.Config) *wechatChatRuntime {
+	return &wechatChatRuntime{
+		config:        cfg,
+		agents:        agent.NewManager(cfg),
+		conversations: conversation.NewManager(),
+		agentSessions: make(map[string]map[string]string),
+		initialized:   make(map[string]bool),
+	}
+}
+
+func (r *wechatChatRuntime) RunWeChatChat(ctx context.Context, input wechat.ChatRunInput, sink wechat.ChatEventSink) error {
+	if input.ConversationID == "" || input.WorkspaceID == "" || input.WorkspacePath == "" || input.AgentID == "" || input.ConversationStore == nil {
+		return errors.New("invalid wechat chat input")
+	}
+
+	conv, isNew, err := r.ensureConversation(input)
+	if err != nil {
+		return err
+	}
+
+	agentProc, err := r.agents.Get(input.AgentID)
+	if err != nil {
+		return r.emitError(sink, "Failed to get agent: "+err.Error())
+	}
+	agentProc.SetWorkingDir(input.WorkspacePath)
+
+	if err := r.ensureInitialized(input.AgentID, sink); err != nil {
+		return err
+	}
+
+	sessionID, _, err := r.ensureAgentSession(input, sink)
+	if err != nil {
+		return err
+	}
+
+	files := make([]conversation.MessageFile, 0, len(input.Files))
+	for _, file := range input.Files {
+		files = append(files, conversation.MessageFile{
+			Name: file.Name,
+			Path: file.Path,
+			Size: file.Size,
+		})
+	}
+
+	r.conversations.AddUserMessage(input.ConversationID, input.Message, files)
+	r.conversations.SetSessionID(input.ConversationID, sessionID)
+
+	if err := sink.Emit(wechat.ChatEvent{
+		Name: "session",
+		Data: map[string]any{
+			"conversationId": input.ConversationID,
+			"sessionId":      sessionID,
+			"agent":          input.AgentID,
+			"isNew":          isNew,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := sink.Emit(wechat.ChatEvent{
+		Name: "status",
+		Data: map[string]string{"message": "Processing..."},
+	}); err != nil {
+		return err
+	}
+
+	streamItems := make([]streamItem, 0)
+	currentText := ""
+	toolCallMap := make(map[string]int)
+	autoPermissionErr := ""
+
+	cleanupNotification := agentProc.OnNotification(func(msg *jsonrpc.Message) {
+		_ = r.handleWeChatNotification(msg, sink, &streamItems, &currentText, toolCallMap)
+	})
+	defer cleanupNotification()
+
+	cleanupPermission := agentProc.OnPermission(func(req *agent.PermissionRequest) {
+		_ = sink.Emit(wechat.ChatEvent{Name: "permission_request", Data: req})
+
+		optionID := firstAllowOption(req.Options)
+		if optionID == "" {
+			autoPermissionErr = "permission request does not allow auto approval"
+			optionID = firstFallbackOption(req.Options)
+			if optionID != "" {
+				agentProc.ConfirmPermission(req.ToolCall.ToolCallID, optionID)
+			}
+			_ = agentProc.Notify("session/cancel", map[string]string{"sessionId": req.SessionID})
+			_ = sink.Emit(wechat.ChatEvent{Name: "error", Data: map[string]string{"message": autoPermissionErr}})
+			return
+		}
+		agentProc.ConfirmPermission(req.ToolCall.ToolCallID, optionID)
+	})
+	defer cleanupPermission()
+
+	stopCancelWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = agentProc.Notify("session/cancel", map[string]string{"sessionId": sessionID})
+		case <-stopCancelWatcher:
+		}
+	}()
+	defer close(stopCancelWatcher)
+
+	promptText := input.Message
+	if input.PromptPrefix != "" {
+		promptText = input.PromptPrefix + "\n\n" + promptText
+	}
+
+	response, err := agentProc.Request("session/prompt", map[string]any{
+		"sessionId": sessionID,
+		"prompt":    []map[string]string{{"type": "text", "text": promptText}},
+	})
+	if err != nil {
+		if autoPermissionErr != "" {
+			return nil
+		}
+		return r.emitError(sink, err.Error())
+	}
+
+	r.finalizeAssistantStream(conv.ID, input.AgentID, streamItems, currentText)
+	if err := r.persistConversation(conv.ID, input.ConversationStore); err != nil {
+		return err
+	}
+
+	if autoPermissionErr != "" {
+		return nil
+	}
+
+	var result map[string]any
+	response.ParseResult(&result)
+	if result == nil {
+		result = make(map[string]any)
+	}
+	if result["stopReason"] == nil {
+		result["stopReason"] = "end_turn"
+	}
+	if err := sink.Emit(wechat.ChatEvent{Name: "done", Data: result}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *wechatChatRuntime) StopAgent(agentID string) error {
+	_ = r.agents.Stop(agentID)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.initialized, agentID)
+	for convID, sessions := range r.agentSessions {
+		delete(sessions, agentID)
+		if len(sessions) == 0 {
+			delete(r.agentSessions, convID)
+		}
+	}
+	return nil
+}
+
+func (r *wechatChatRuntime) Shutdown() error {
+	return r.agents.Shutdown()
+}
+
+func (r *wechatChatRuntime) ensureConversation(input wechat.ChatRunInput) (*conversation.Conversation, bool, error) {
+	if conv := r.conversations.Get(input.ConversationID); conv != nil {
+		return conv, false, nil
+	}
+
+	stored, err := input.ConversationStore.Load(input.ConversationID)
+	switch {
+	case err == nil:
+		conv := r.restoreStoredConversation(stored)
+		return conv, false, nil
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		return nil, false, err
+	}
+
+	conv := r.conversations.Create(input.ConversationID, input.AgentID, input.WorkspaceID)
+	return conv, true, nil
+}
+
+func (r *wechatChatRuntime) restoreStoredConversation(session *storage.StoredSession) *conversation.Conversation {
+	conv := r.conversations.Create(session.ID, session.ActiveAgent, session.WorkspaceID)
+	conv.Messages = append([]conversation.Message(nil), session.Messages...)
+	conv.ActiveAgent = session.ActiveAgent
+	conv.WorkspaceID = session.WorkspaceID
+	conv.CreatedAt = session.CreatedAt
+
+	r.mu.Lock()
+	if _, ok := r.agentSessions[session.ID]; !ok {
+		r.agentSessions[session.ID] = make(map[string]string)
+	}
+	r.mu.Unlock()
+	return conv
+}
+
+func (r *wechatChatRuntime) persistConversation(convID string, store wechat.HiddenConversationStore) error {
+	conv := r.conversations.Get(convID)
+	if conv == nil {
+		return nil
+	}
+	session := &storage.StoredSession{
+		ID:          conv.ID,
+		Title:       storage.GenerateTitle(conv.Messages),
+		Messages:    append([]conversation.Message(nil), conv.Messages...),
+		ActiveAgent: conv.ActiveAgent,
+		WorkspaceID: conv.WorkspaceID,
+		CreatedAt:   conv.CreatedAt,
+		UpdatedAt:   time.Now().UnixMilli(),
+	}
+	return store.Save(session)
+}
+
+func (r *wechatChatRuntime) ensureInitialized(agentID string, sink wechat.ChatEventSink) error {
+	r.mu.Lock()
+	initialized := r.initialized[agentID]
+	r.mu.Unlock()
+	if initialized {
+		return nil
+	}
+
+	if err := sink.Emit(wechat.ChatEvent{
+		Name: "status",
+		Data: map[string]string{"message": fmt.Sprintf("Initializing %s...", agentID)},
+	}); err != nil {
+		return err
+	}
+	if _, err := r.agents.Request(agentID, "initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientCapabilities": map[string]any{
+			"fs": map[string]bool{"readTextFile": true, "writeTextFile": true},
+		},
+		"clientInfo": map[string]string{"name": "lumi-go-wechat", "version": "0.1.0"},
+	}); err != nil {
+		return r.emitError(sink, err.Error())
+	}
+
+	r.mu.Lock()
+	r.initialized[agentID] = true
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *wechatChatRuntime) ensureAgentSession(input wechat.ChatRunInput, sink wechat.ChatEventSink) (string, bool, error) {
+	r.mu.Lock()
+	sessions := r.agentSessions[input.ConversationID]
+	if sessions == nil {
+		sessions = make(map[string]string)
+		r.agentSessions[input.ConversationID] = sessions
+	}
+	sessionID := sessions[input.AgentID]
+	r.mu.Unlock()
+	if sessionID != "" {
+		return sessionID, false, nil
+	}
+
+	result, err := r.agents.Request(input.AgentID, "session/new", map[string]any{
+		"cwd":        input.WorkspacePath,
+		"mcpServers": []any{},
+	})
+	if err != nil {
+		return "", false, r.emitError(sink, err.Error())
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return "", false, r.emitError(sink, "invalid session/new response")
+	}
+	sessionID, _ = resultMap["sessionId"].(string)
+	if sessionID == "" {
+		return "", false, r.emitError(sink, "session/new response missing sessionId")
+	}
+	if r.shouldSetSessionMode(input.AgentID, input.SessionModeOverride) {
+		if _, err := r.agents.Request(input.AgentID, "session/set_mode", map[string]any{
+			"sessionId": sessionID,
+			"modeId":    input.SessionModeOverride,
+		}); err != nil {
+			return "", false, r.emitError(sink, err.Error())
+		}
+	}
+
+	r.mu.Lock()
+	r.agentSessions[input.ConversationID][input.AgentID] = sessionID
+	r.mu.Unlock()
+	return sessionID, true, nil
+}
+
+func (r *wechatChatRuntime) shouldSetSessionMode(agentID string, sessionMode string) bool {
+	agentConfig := r.config.FindAgent(agentID)
+	if agentConfig == nil {
+		return false
+	}
+	backend := agentmode.DetectBackend(agentConfig.ID, agentConfig.Command, agentConfig.Args)
+	return agentmode.ShouldSetACPMode(backend, sessionMode)
+}
+
+func (r *wechatChatRuntime) finalizeAssistantStream(convID, agentID string, streamItems []streamItem, currentText string) {
+	if currentText != "" {
+		streamItems = append(streamItems, streamItem{Type: "text", Text: currentText})
+	}
+	for _, item := range streamItems {
+		if item.Type == "text" {
+			r.conversations.AddAssistantMessage(convID, item.Text, agentID)
+			continue
+		}
+		if item.Tool != nil {
+			r.conversations.AddToolCall(convID, item.Tool, agentID)
+		}
+	}
+}
+
+// V1 WeChat-private copy of api notification aggregation.
+// Keep Web notification.go unchanged; dedupe in V2 only after WeChat V1 stabilizes.
+func (r *wechatChatRuntime) handleWeChatNotification(
+	msg *jsonrpc.Message,
+	sink wechat.ChatEventSink,
+	streamItems *[]streamItem,
+	currentText *string,
+	toolCallMap map[string]int,
+) error {
+	if msg.Method != "session/update" {
+		return nil
+	}
+
+	var params struct {
+		Update sessionUpdate `json:"update"`
+	}
+	if err := msg.ParseParams(&params); err != nil {
+		return nil
+	}
+
+	update := params.Update
+	switch update.SessionUpdate {
+	case "agent_message_chunk", "agent_thought_chunk":
+		if text := extractTextContent(update.Content); text != "" {
+			*currentText += text
+		}
+		return sink.Emit(wechat.ChatEvent{Name: "update", Data: map[string]any{"update": toWeChatUpdate(update)}})
+
+	case "tool_call", "tool_call_update":
+		if *currentText != "" {
+			*streamItems = append(*streamItems, streamItem{Type: "text", Text: *currentText})
+			*currentText = ""
+		}
+
+		toolID := update.ToolCallID
+		if toolID == "" {
+			return nil
+		}
+		toolName := update.Kind
+		if update.Meta != nil && update.Meta.ClaudeCode != nil && update.Meta.ClaudeCode.ToolName != "" {
+			toolName = update.Meta.ClaudeCode.ToolName
+		}
+		title := update.Title
+		if title == "" {
+			title = toolID
+		}
+		status := "pending"
+		hasError := update.Error != "" || (update.Meta != nil && update.Meta.ClaudeCode != nil && update.Meta.ClaudeCode.Error != "")
+		if hasError {
+			status = "error"
+		} else if update.Status == "completed" {
+			status = "completed"
+		}
+		input := extractInput(update.RawInput)
+		output, errMsg := extractOutput(update)
+		description := ""
+		if update.Status != "completed" {
+			description = extractDescription(update.Content)
+		}
+		var rawInputJSON string
+		if len(update.RawInput) > 0 {
+			if data, err := json.Marshal(update.RawInput); err == nil {
+				rawInputJSON = string(data)
+			}
+		}
+		toolCall := &conversation.ToolCallInfo{
+			ToolCallID:  toolID,
+			ToolName:    toolName,
+			Kind:        update.Kind,
+			Title:       title,
+			Description: description,
+			Status:      status,
+			Input:       input,
+			RawInput:    rawInputJSON,
+			Output:      output,
+			Error:       errMsg,
+		}
+		if idx, ok := toolCallMap[toolID]; ok {
+			(*streamItems)[idx] = streamItem{Type: "tool", Tool: toolCall}
+		} else {
+			toolCallMap[toolID] = len(*streamItems)
+			*streamItems = append(*streamItems, streamItem{Type: "tool", Tool: toolCall})
+		}
+		return sink.Emit(wechat.ChatEvent{Name: "tool_call", Data: map[string]any{
+			"toolCallId":    toolID,
+			"toolName":      toolName,
+			"kind":          update.Kind,
+			"title":         title,
+			"description":   description,
+			"status":        status,
+			"input":         input,
+			"rawInput":      rawInputJSON,
+			"output":        output,
+			"error":         errMsg,
+			"sessionUpdate": update.SessionUpdate,
+		}})
+
+	default:
+		return sink.Emit(wechat.ChatEvent{Name: "update", Data: map[string]any{"update": toWeChatUpdate(update)}})
+	}
+}
+
+func (r *wechatChatRuntime) emitError(sink wechat.ChatEventSink, message string) error {
+	return sink.Emit(wechat.ChatEvent{Name: "error", Data: map[string]string{"message": message}})
+}
+
+func firstAllowOption(options []struct {
+	OptionID string `json:"optionId"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+}) string {
+	for _, option := range options {
+		if option.Kind == "allow_once" {
+			return option.OptionID
+		}
+	}
+	for _, option := range options {
+		if option.Kind == "allow_always" {
+			return option.OptionID
+		}
+	}
+	return ""
+}
+
+func firstFallbackOption(options []struct {
+	OptionID string `json:"optionId"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+}) string {
+	for _, option := range options {
+		if option.Kind == "reject_once" || option.Kind == "reject_always" {
+			return option.OptionID
+		}
+	}
+	if len(options) > 0 {
+		return options[0].OptionID
+	}
+	return ""
+}
+
+func toWeChatUpdate(update sessionUpdate) map[string]any {
+	result := map[string]any{
+		"sessionUpdate": update.SessionUpdate,
+	}
+	if update.Content != nil {
+		result["content"] = update.Content
+	}
+	if update.ToolCallID != "" {
+		result["toolCallId"] = update.ToolCallID
+	}
+	if update.Title != "" {
+		result["title"] = update.Title
+	}
+	if update.Status != "" {
+		result["status"] = update.Status
+	}
+	if update.Kind != "" {
+		result["kind"] = update.Kind
+	}
+	if update.RawInput != nil {
+		result["rawInput"] = update.RawInput
+	}
+	if update.Error != "" {
+		result["error"] = update.Error
+	}
+	return result
+}

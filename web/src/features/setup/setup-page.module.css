@@ -1,0 +1,244 @@
+.page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-root);
+  padding: 20px;
+}
+
+.card {
+  width: 100%;
+  max-width: 550px;
+  padding: 40px;
+  background: var(--bg-surface);
+  border: 1px solid var(--bg-element);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.header {
+  margin-bottom: 24px;
+  text-align: center;
+}
+
+.title {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.section {
+  margin-bottom: 20px;
+}
+
+.sectionTitle {
+  margin: 0 0 12px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--bg-surface-hover);
+  border: 1px solid var(--bg-element);
+  border-radius: var(--radius-md);
+}
+
+.success {
+  border-color: var(--status-success-border);
+}
+
+.error {
+  border-color: var(--status-error-border);
+}
+
+.pending {
+  border-color: var(--status-warning-border);
+}
+
+.blocked {
+  border-color: var(--status-muted-border);
+  opacity: 0.7;
+}
+
+.statusIcon {
+  width: 20px;
+  text-align: center;
+  font-size: 14px;
+}
+
+.success .statusIcon {
+  color: var(--status-success);
+}
+
+.error .statusIcon {
+  color: var(--status-error);
+}
+
+.pending .statusIcon {
+  color: var(--status-warning);
+  animation: pulse 1s infinite;
+}
+
+.blocked .statusIcon {
+  color: var(--status-muted);
+}
+
+.itemInfo {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.itemName {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.itemDetail {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.itemStatus {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-align: right;
+}
+
+.installHint {
+  max-width: 200px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.installLink {
+  color: var(--accent-success);
+  font-size: 11px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.installLink:hover {
+  opacity: 0.8;
+}
+
+.errorMessage {
+  margin-bottom: 16px;
+  padding: 12px;
+  color: var(--status-error);
+  background: var(--status-error-bg);
+  border: 1px solid var(--status-error-border);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+}
+
+.actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+}
+
+.button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 32px;
+  border: none;
+  border-radius: var(--radius-md);
+  color: var(--bg-root);
+  font-size: 14px;
+  font-weight: 600;
+  transition: opacity var(--duration-fast);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.installButton {
+  background: var(--accent-primary);
+}
+
+.continueButton {
+  background: var(--accent-success);
+}
+
+.blockedButton {
+  background: var(--text-tertiary);
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 640px) {
+  .card {
+    padding: 24px;
+  }
+
+  .item {
+    align-items: flex-start;
+  }
+
+  .itemStatus {
+    max-width: 36%;
+  }
+}

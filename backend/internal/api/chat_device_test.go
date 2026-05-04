@@ -1,0 +1,645 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/pengmide/lumi/internal/agentmode"
+	"github.com/pengmide/lumi/internal/config"
+	"github.com/pengmide/lumi/internal/device"
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
+)
+
+func TestHandleDeviceChatBridgesSSEAndRoutesPermissionConfirm(t *testing.T) {
+	server := newTestAPIServer(t)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	secret, err := device.EnsureSecret("")
+	if err != nil {
+		t.Fatalf("EnsureSecret() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := connectTestDevice(t, ctx, httpServer.URL, secret)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	registerAndReadyDevice(t, ctx, conn)
+
+	bodyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		payload := bytes.NewBufferString(`{"message":"hello remote","conversationId":"","workspaceId":"default","deviceId":"dev-1"}`)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+"/api/chat", payload)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		bodyCh <- string(data)
+	}()
+
+	taskExecute := readEnvelope(t, ctx, conn)
+	if taskExecute.Type != device.MsgTaskExecute {
+		t.Fatalf("taskExecute.Type = %q, want %q", taskExecute.Type, device.MsgTaskExecute)
+	}
+	if err := wsjson.Write(ctx, conn, device.AckEnvelope(taskExecute.ID)); err != nil {
+		t.Fatalf("wsjson.Write(task.execute ack) error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskSession, "msg-session", "dev-1", taskExecute.TaskID, device.TaskSessionPayload{
+		SessionID: "remote-session-1",
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgPermissionRequest, "msg-perm", "dev-1", taskExecute.TaskID, device.PermissionRequestPayload{
+		SessionID: "remote-session-1",
+		Options: []device.PermissionOption{
+			{OptionID: "allow-once", Name: "Allow once", Kind: "allow_once"},
+		},
+		ToolCall: device.PermissionToolCall{
+			ToolCallID: "tool-1",
+			Title:      "Run command",
+			Kind:       "command",
+			RawInput:   json.RawMessage(`{"command":"pwd"}`),
+		},
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskEvent, "msg-event", "dev-1", taskExecute.TaskID, device.TaskEventPayload{
+		SessionID: "remote-session-1",
+		Notification: device.ACPNotification{
+			JSONRPC: "2.0",
+			Method:  "session/update",
+			Params:  json.RawMessage(`{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from device"}}}`),
+		},
+	}))
+
+	confirmAckCh := make(chan error, 1)
+	go func() {
+		permissionConfirm := readEnvelope(t, ctx, conn)
+		if permissionConfirm.Type != device.MsgPermissionConfirm {
+			confirmAckCh <- io.ErrUnexpectedEOF
+			return
+		}
+		confirmAckCh <- wsjson.Write(ctx, conn, device.AckEnvelope(permissionConfirm.ID))
+	}()
+
+	confirmPayload := bytes.NewBufferString(`{"agentId":"claude","toolCallId":"tool-1","optionId":"allow-once"}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+"/api/permission/confirm", confirmPayload)
+	if err != nil {
+		t.Fatalf("NewRequest(permission.confirm) error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("permission confirm request error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("permission confirm status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if err := <-confirmAckCh; err != nil {
+		t.Fatalf("permission confirm ack error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskDone, "msg-done", "dev-1", taskExecute.TaskID, device.TaskDonePayload{
+		Result: json.RawMessage(`{"stopReason":"end_turn"}`),
+	}))
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("chat request error = %v", err)
+	case body := <-bodyCh:
+		if !strings.Contains(body, `event: session`) || !strings.Contains(body, `remote-session-1`) {
+			t.Fatalf("SSE body missing session event: %s", body)
+		}
+		if !strings.Contains(body, `event: permission_request`) || !strings.Contains(body, `tool-1`) {
+			t.Fatalf("SSE body missing permission request: %s", body)
+		}
+		if !strings.Contains(body, `hello from device`) {
+			t.Fatalf("SSE body missing streamed text: %s", body)
+		}
+		if !strings.Contains(body, `event: done`) {
+			t.Fatalf("SSE body missing done event: %s", body)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for SSE response")
+	}
+
+	if got := server.getRemoteSession(server.sessionStore.List()[0].ID, "dev-1", "claude"); got != "remote-session-1" {
+		t.Fatalf("getRemoteSession() = %q, want %q", got, "remote-session-1")
+	}
+
+	convID := server.sessionStore.List()[0].ID
+	secondBodyCh := make(chan string, 1)
+	secondErrCh := make(chan error, 1)
+	go func() {
+		payload := bytes.NewBufferString(`{"message":"write a file","conversationId":"` + convID + `","workspaceId":"default","deviceId":"dev-1"}`)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+"/api/chat", payload)
+		if err != nil {
+			secondErrCh <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			secondErrCh <- err
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			secondErrCh <- err
+			return
+		}
+		secondBodyCh <- string(data)
+	}()
+
+	secondTaskExecute := readEnvelope(t, ctx, conn)
+	if secondTaskExecute.Type != device.MsgTaskExecute {
+		t.Fatalf("second taskExecute.Type = %q, want %q", secondTaskExecute.Type, device.MsgTaskExecute)
+	}
+	var secondPayload device.TaskExecutePayload
+	if err := json.Unmarshal(secondTaskExecute.Payload, &secondPayload); err != nil {
+		t.Fatalf("Unmarshal(second task.execute payload) error = %v", err)
+	}
+	if secondPayload.SessionID != "remote-session-1" {
+		t.Fatalf("second task sessionId = %q, want remote-session-1", secondPayload.SessionID)
+	}
+	if err := wsjson.Write(ctx, conn, device.AckEnvelope(secondTaskExecute.ID)); err != nil {
+		t.Fatalf("wsjson.Write(second task.execute ack) error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgPermissionRequest, "msg-perm-2", "dev-1", secondTaskExecute.TaskID, device.PermissionRequestPayload{
+		SessionID: "remote-session-1",
+		Options: []device.PermissionOption{
+			{OptionID: "allow-once", Name: "Allow once", Kind: "allow_once"},
+		},
+		ToolCall: device.PermissionToolCall{
+			ToolCallID: "tool-2",
+			Title:      "Write file",
+			Kind:       "edit",
+			RawInput:   json.RawMessage(`{"file_path":"a.txt"}`),
+		},
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskDone, "msg-done-2", "dev-1", secondTaskExecute.TaskID, device.TaskDonePayload{
+		Result: json.RawMessage(`{"stopReason":"end_turn"}`),
+	}))
+
+	select {
+	case err := <-secondErrCh:
+		t.Fatalf("second chat request error = %v", err)
+	case body := <-secondBodyCh:
+		if strings.Contains(body, "Device protocol error") {
+			t.Fatalf("second SSE body should not contain protocol error: %s", body)
+		}
+		if !strings.Contains(body, `event: permission_request`) || !strings.Contains(body, `tool-2`) {
+			t.Fatalf("second SSE body missing permission request: %s", body)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for second SSE response")
+	}
+}
+
+func TestHandleDeviceChatBuffersNotificationsBeforeSession(t *testing.T) {
+	server := newTestAPIServer(t)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	secret, err := device.EnsureSecret("")
+	if err != nil {
+		t.Fatalf("EnsureSecret() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := connectTestDevice(t, ctx, httpServer.URL, secret)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	registerAndReadyDevice(t, ctx, conn)
+
+	bodyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		payload := bytes.NewBufferString(`{"message":"hello remote","workspaceId":"default","deviceId":"dev-1"}`)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+"/api/chat", payload)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		bodyCh <- string(data)
+	}()
+
+	taskExecute := readEnvelope(t, ctx, conn)
+	if taskExecute.Type != device.MsgTaskExecute {
+		t.Fatalf("taskExecute.Type = %q, want %q", taskExecute.Type, device.MsgTaskExecute)
+	}
+	if err := wsjson.Write(ctx, conn, device.AckEnvelope(taskExecute.ID)); err != nil {
+		t.Fatalf("wsjson.Write(task.execute ack) error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskEvent, "msg-event-before-session", "dev-1", taskExecute.TaskID, device.TaskEventPayload{
+		Notification: device.ACPNotification{
+			JSONRPC: "2.0",
+			Method:  "session/update",
+			Params:  json.RawMessage(`{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"early hello"}}}`),
+		},
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskSession, "msg-session-after-event", "dev-1", taskExecute.TaskID, device.TaskSessionPayload{
+		SessionID: "remote-session-early",
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskDone, "msg-done-after-event", "dev-1", taskExecute.TaskID, device.TaskDonePayload{
+		Result: json.RawMessage(`{"stopReason":"end_turn"}`),
+	}))
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("chat request error = %v", err)
+	case body := <-bodyCh:
+		if strings.Contains(body, "Device protocol error") {
+			t.Fatalf("SSE body should not contain protocol error: %s", body)
+		}
+		if !strings.Contains(body, `event: session`) || !strings.Contains(body, `remote-session-early`) {
+			t.Fatalf("SSE body missing session event: %s", body)
+		}
+		if !strings.Contains(body, `early hello`) {
+			t.Fatalf("SSE body missing buffered text: %s", body)
+		}
+		if !strings.Contains(body, `event: done`) {
+			t.Fatalf("SSE body missing done event: %s", body)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for SSE response")
+	}
+}
+
+func TestHandleDeviceChatAutoApprovesPermissionsForYoloMode(t *testing.T) {
+	server := newTestAPIServer(t)
+	server.config.FindAgent("claude").SessionMode = agentmode.ClaudeModeBypassPermissions
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	secret, err := device.EnsureSecret("")
+	if err != nil {
+		t.Fatalf("EnsureSecret() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := connectTestDevice(t, ctx, httpServer.URL, secret)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	registerAndReadyDevice(t, ctx, conn)
+
+	bodyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		payload := bytes.NewBufferString(`{"message":"create a file","conversationId":"","workspaceId":"default","deviceId":"dev-1"}`)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+"/api/chat", payload)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		bodyCh <- string(data)
+	}()
+
+	taskExecute := readEnvelope(t, ctx, conn)
+	if taskExecute.Type != device.MsgTaskExecute {
+		t.Fatalf("taskExecute.Type = %q, want %q", taskExecute.Type, device.MsgTaskExecute)
+	}
+	if err := wsjson.Write(ctx, conn, device.AckEnvelope(taskExecute.ID)); err != nil {
+		t.Fatalf("wsjson.Write(task.execute ack) error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskSession, "msg-session-auto", "dev-1", taskExecute.TaskID, device.TaskSessionPayload{
+		SessionID: "remote-session-auto",
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgPermissionRequest, "msg-perm-auto", "dev-1", taskExecute.TaskID, device.PermissionRequestPayload{
+		SessionID: "remote-session-auto",
+		Options: []device.PermissionOption{
+			{OptionID: "allow-once", Name: "Allow once", Kind: "allow_once"},
+		},
+		ToolCall: device.PermissionToolCall{
+			ToolCallID: "tool-auto",
+			Title:      "Write file",
+			Kind:       "edit",
+			RawInput:   json.RawMessage(`{"file_path":"a.txt"}`),
+		},
+	}))
+
+	permissionConfirm := readEnvelope(t, ctx, conn)
+	if permissionConfirm.Type != device.MsgPermissionConfirm {
+		t.Fatalf("permissionConfirm.Type = %q, want %q", permissionConfirm.Type, device.MsgPermissionConfirm)
+	}
+	if err := wsjson.Write(ctx, conn, device.AckEnvelope(permissionConfirm.ID)); err != nil {
+		t.Fatalf("wsjson.Write(permission.confirm ack) error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskDone, "msg-done-auto", "dev-1", taskExecute.TaskID, device.TaskDonePayload{
+		Result: json.RawMessage(`{"stopReason":"end_turn"}`),
+	}))
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("chat request error = %v", err)
+	case body := <-bodyCh:
+		if strings.Contains(body, `event: permission_request`) {
+			t.Fatalf("SSE body should not contain permission_request when yolo mode is enabled: %s", body)
+		}
+		if !strings.Contains(body, `event: done`) {
+			t.Fatalf("SSE body missing done event: %s", body)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for SSE response")
+	}
+}
+
+func TestHandleDeviceChatInlinesRemoteWorkspaceFileMentions(t *testing.T) {
+	server := newTestAPIServer(t)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	secret, err := device.EnsureSecret("")
+	if err != nil {
+		t.Fatalf("EnsureSecret() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := connectTestDevice(t, ctx, httpServer.URL, secret)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	registerAndReadyDevice(t, ctx, conn)
+
+	remoteDir := t.TempDir()
+	server.config.Workspaces = append(server.config.Workspaces, config.WorkspaceConfig{
+		ID:         "remote-ws",
+		Name:       "Remote",
+		Path:       remoteDir,
+		Kind:       "remote",
+		DeviceID:   "dev-1",
+		DeviceName: "Office Mac",
+		RemotePath: remoteDir,
+	})
+
+	bodyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		payload := bytes.NewBufferString(`{"message":"Review @src/app.ts for me","conversationId":"","workspaceId":"remote-ws","deviceId":"dev-1"}`)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+"/api/chat", payload)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		bodyCh <- string(data)
+	}()
+
+	workspaceReq := readEnvelope(t, ctx, conn)
+	if workspaceReq.Type != device.MsgWorkspaceText {
+		t.Fatalf("workspaceReq.Type = %q, want %q", workspaceReq.Type, device.MsgWorkspaceText)
+	}
+	var workspacePayload device.WorkspaceRequestPayload
+	if err := json.Unmarshal(workspaceReq.Payload, &workspacePayload); err != nil {
+		t.Fatalf("Unmarshal(workspace request payload) error = %v", err)
+	}
+	if workspacePayload.WorkspacePath != remoteDir {
+		t.Fatalf("workspacePayload.WorkspacePath = %q, want %q", workspacePayload.WorkspacePath, remoteDir)
+	}
+	if workspacePayload.Path != "src/app.ts" {
+		t.Fatalf("workspacePayload.Path = %q, want %q", workspacePayload.Path, "src/app.ts")
+	}
+
+	workspaceResp, err := device.NewEnvelope(device.MsgWorkspaceResponse, workspaceReq.ID, "dev-1", "", device.WorkspaceResponsePayload{
+		OK: true,
+		Payload: json.RawMessage(`{
+			"meta":{"path":"src/app.ts","name":"app.ts","size":18,"modifiedAt":1700000000000,"previewKind":"code"},
+			"content":"export const ok = true;\n"
+		}`),
+	})
+	if err != nil {
+		t.Fatalf("NewEnvelope(workspace.response) error = %v", err)
+	}
+	if err := wsjson.Write(ctx, conn, workspaceResp); err != nil {
+		t.Fatalf("wsjson.Write(workspace.response) error = %v", err)
+	}
+
+	taskExecute := readEnvelope(t, ctx, conn)
+	if taskExecute.Type != device.MsgTaskExecute {
+		t.Fatalf("taskExecute.Type = %q, want %q", taskExecute.Type, device.MsgTaskExecute)
+	}
+	var taskPayload device.TaskExecutePayload
+	if err := json.Unmarshal(taskExecute.Payload, &taskPayload); err != nil {
+		t.Fatalf("Unmarshal(task.execute payload) error = %v", err)
+	}
+	if !strings.Contains(taskPayload.Prompt, "[Remote workspace @file context]") {
+		t.Fatalf("taskPayload.Prompt = %q, want remote file context header", taskPayload.Prompt)
+	}
+	if !strings.Contains(taskPayload.Prompt, "--- BEGIN REMOTE FILE: src/app.ts ---") {
+		t.Fatalf("taskPayload.Prompt = %q, want inlined remote file block", taskPayload.Prompt)
+	}
+	if !strings.Contains(taskPayload.Prompt, "export const ok = true;") {
+		t.Fatalf("taskPayload.Prompt = %q, want inlined remote file content", taskPayload.Prompt)
+	}
+	if !strings.Contains(taskPayload.Prompt, "[User message]\nReview @src/app.ts for me") {
+		t.Fatalf("taskPayload.Prompt = %q, want original user message section", taskPayload.Prompt)
+	}
+	if err := wsjson.Write(ctx, conn, device.AckEnvelope(taskExecute.ID)); err != nil {
+		t.Fatalf("wsjson.Write(task.execute ack) error = %v", err)
+	}
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskSession, "msg-session-inline", "dev-1", taskExecute.TaskID, device.TaskSessionPayload{
+		SessionID: "remote-session-inline",
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgTaskDone, "msg-done-inline", "dev-1", taskExecute.TaskID, device.TaskDonePayload{
+		Result: json.RawMessage(`{"stopReason":"end_turn"}`),
+	}))
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("chat request error = %v", err)
+	case body := <-bodyCh:
+		if strings.Contains(body, `event: error`) {
+			t.Fatalf("SSE body should not contain error: %s", body)
+		}
+		if !strings.Contains(body, `event: done`) {
+			t.Fatalf("SSE body missing done event: %s", body)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for SSE response")
+	}
+}
+
+func connectTestDevice(t *testing.T, ctx context.Context, serverURL string, secret string) *websocket.Conn {
+	t.Helper()
+
+	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/api/devices/ws"
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+secret)
+
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: headers})
+	if err != nil {
+		t.Fatalf("websocket.Dial() error = %v", err)
+	}
+	return conn
+}
+
+func registerAndReadyDevice(t *testing.T, ctx context.Context, conn *websocket.Conn) {
+	t.Helper()
+
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgDeviceRegister, "msg-register", "dev-1", "", device.DeviceRegisterPayload{
+		DeviceID: "dev-1",
+		Name:     "Office Mac",
+		Agents:   []device.DeviceAgentInfo{{ID: "claude", Name: "Claude Code"}},
+	}))
+	sendDeviceEventWithAck(t, ctx, conn, mustEnvelope(t, device.MsgSetupStatus, "msg-setup", "dev-1", "", device.SetupStatusPayload{
+		Ready: true,
+	}))
+}
+
+func sendDeviceEventWithAck(t *testing.T, ctx context.Context, conn *websocket.Conn, env device.Envelope) {
+	t.Helper()
+
+	if err := wsjson.Write(ctx, conn, env); err != nil {
+		t.Fatalf("wsjson.Write(%s) error = %v", env.Type, err)
+	}
+	ack := readEnvelope(t, ctx, conn)
+	if ack.Type != device.MsgAck || ack.ID != env.ID {
+		t.Fatalf("ack = %+v, want ack for %s", ack, env.Type)
+	}
+}
+
+func readEnvelope(t *testing.T, ctx context.Context, conn *websocket.Conn) device.Envelope {
+	t.Helper()
+
+	var env device.Envelope
+	if err := wsjson.Read(ctx, conn, &env); err != nil {
+		t.Fatalf("wsjson.Read() error = %v", err)
+	}
+	return env
+}
+
+func mustEnvelope(t *testing.T, typ device.MessageType, id, deviceID, taskID string, payload any) device.Envelope {
+	t.Helper()
+
+	env, err := device.NewEnvelope(typ, id, deviceID, taskID, payload)
+	if err != nil {
+		t.Fatalf("NewEnvelope(%s) error = %v", typ, err)
+	}
+	return env
+}
+
+func TestHandleDeviceChatReturnsOfflineError(t *testing.T) {
+	server := newTestAPIServer(t)
+	registerTestDevice(t, server, "dev-offline", false)
+	server.devices.MarkDisconnected("dev-offline", "offline")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewBufferString(`{"message":"hello","workspaceId":"default","deviceId":"dev-offline"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	body, err := io.ReadAll(rec.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll() error = %v", err)
+	}
+	if !strings.Contains(string(body), `Device is offline`) {
+		t.Fatalf("body = %s, want offline error", body)
+	}
+}
+
+func TestHandleDeviceChatUnavailableMentionDoesNotSwitchActiveAgent(t *testing.T) {
+	server := newTestAPIServer(t)
+	registerTestDevice(t, server, "dev-1", true)
+	server.conversations.Create("conv-1", "claude", "default")
+	server.agentSessions["conv-1"] = make(map[string]string)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewBufferString(`{"message":"@codex hello","conversationId":"conv-1","workspaceId":"default","deviceId":"dev-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	body, err := io.ReadAll(rec.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll() error = %v", err)
+	}
+	if !strings.Contains(string(body), `Agent not available on device: codex`) {
+		t.Fatalf("body = %s, want unavailable agent error", body)
+	}
+
+	conv := server.conversations.Get("conv-1")
+	if conv == nil {
+		t.Fatalf("conversation conv-1 not found")
+	}
+	if conv.ActiveAgent != "claude" {
+		t.Fatalf("conv.ActiveAgent = %q, want claude", conv.ActiveAgent)
+	}
+}

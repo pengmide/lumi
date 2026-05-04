@@ -1,0 +1,10 @@
+third
+node_modules
+dist
+backend/cmd/lumi/web
+backend/lumi.config.json
+backend/lumi
+.DS_Store
+.lumi-uploads/
+.playwright-cli/
+docker/sandbox/bin/
