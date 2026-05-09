@@ -151,8 +151,17 @@ func (r *wecomChatRuntime) RunWeComChat(ctx context.Context, input wecom.ChatRun
 		return r.emitError(sink, err.Error())
 	}
 
-	if err := r.executeCronCommands(input, &streamItems, &accumulator.currentText); err != nil {
+	cronConfirmation, err := r.executeCronCommands(input, &streamItems, &accumulator.currentText)
+	if err != nil {
 		return r.emitError(sink, err.Error())
+	}
+	if cronConfirmation != "" {
+		if err := sink.Emit(wecom.ChatEvent{Name: "update", Data: map[string]any{"update": map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]any{"type": "text", "text": cronConfirmation},
+		}}}); err != nil {
+			return err
+		}
 	}
 	r.finalizeAssistantStream(conv.ID, input.AgentID, streamItems, accumulator)
 	if err := r.persistConversation(conv.ID, input.ConversationStore); err != nil {
@@ -335,15 +344,14 @@ func (r *wecomChatRuntime) finalizeAssistantStream(convID, agentID string, strea
 	}
 }
 
-func (r *wecomChatRuntime) executeCronCommands(input wecom.ChatRunInput, streamItems *[]streamItem, currentText *string) error {
-	_, err := executeCronCommandsWithService(r.cron, cronCommandContext{
+func (r *wecomChatRuntime) executeCronCommands(input wecom.ChatRunInput, streamItems *[]streamItem, currentText *string) (string, error) {
+	return executeCronCommandsWithService(r.cron, cronCommandContext{
 		Channel:        lumicron.ChannelWeCom,
 		ConversationID: input.ConversationID,
 		AgentID:        input.AgentID,
 		WorkspaceID:    input.WorkspaceID,
 		Target:         input.CronTarget,
 	}, streamItems, currentText)
-	return err
 }
 
 func (r *wecomChatRuntime) currentCronJobsForPrompt(conversationID string) []lumicron.Job {
