@@ -8,3 +8,4 @@ backend/lumi
 .lumi-uploads/
 .playwright-cli/
 docker/sandbox/bin/
+cli/lumi-cli
