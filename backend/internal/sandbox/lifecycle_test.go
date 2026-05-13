@@ -1,6 +1,12 @@
 package sandbox
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"github.com/docker/docker/api/types"
+	"github.com/pengmide/lumi/internal/sandbox/docker"
+)
 
 func TestActiveRuntimeWorkspaceIDsExcludesTerminated(t *testing.T) {
 	manager := &Manager{
@@ -67,4 +73,93 @@ func TestShouldRemoveRecoveredContainer(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShutdownPreserveContainersStopsSchedulerAndClosesClient(t *testing.T) {
+	fakeDocker := &fakeDockerClient{}
+	manager := &Manager{
+		docker: fakeDocker,
+		runtimes: map[string]*RuntimeRecord{
+			"running": {WorkspaceID: "running", Status: StatusRunning, ContainerName: "lumi-running"},
+		},
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	go manager.runScheduler()
+
+	if err := manager.ShutdownPreserveContainers(); err != nil {
+		t.Fatalf("ShutdownPreserveContainers() error = %v", err)
+	}
+	if !fakeDocker.closed {
+		t.Fatal("docker client was not closed")
+	}
+	if fakeDocker.stopRemoveCalls != 0 {
+		t.Fatalf("StopRemoveContainer calls = %d, want 0", fakeDocker.stopRemoveCalls)
+	}
+	if got := manager.runtimes["running"].Status; got != StatusRunning {
+		t.Fatalf("runtime status = %q, want %q", got, StatusRunning)
+	}
+}
+
+func TestShutdownPreservesContainers(t *testing.T) {
+	fakeDocker := &fakeDockerClient{}
+	manager := &Manager{
+		docker: fakeDocker,
+		runtimes: map[string]*RuntimeRecord{
+			"running": {WorkspaceID: "running", Status: StatusRunning, ContainerName: "lumi-running"},
+		},
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	go manager.runScheduler()
+
+	if err := manager.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if fakeDocker.stopRemoveCalls != 0 {
+		t.Fatalf("StopRemoveContainer calls = %d, want 0", fakeDocker.stopRemoveCalls)
+	}
+}
+
+type fakeDockerClient struct {
+	closed          bool
+	stopRemoveCalls int
+}
+
+func (f *fakeDockerClient) Close() error {
+	f.closed = true
+	return nil
+}
+
+func (f *fakeDockerClient) CreateContainer(context.Context, docker.ContainerSpec) (string, error) {
+	return "", nil
+}
+
+func (f *fakeDockerClient) ImageExists(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeDockerClient) InspectContainer(context.Context, string) (types.ContainerJSON, error) {
+	return types.ContainerJSON{}, nil
+}
+
+func (f *fakeDockerClient) ListSandboxContainers(context.Context) ([]types.Container, error) {
+	return nil, nil
+}
+
+func (f *fakeDockerClient) Ping(context.Context) error {
+	return nil
+}
+
+func (f *fakeDockerClient) PullImage(context.Context, string) error {
+	return nil
+}
+
+func (f *fakeDockerClient) StartContainer(context.Context, string) error {
+	return nil
+}
+
+func (f *fakeDockerClient) StopRemoveContainer(context.Context, string) error {
+	f.stopRemoveCalls++
+	return nil
 }

@@ -2,13 +2,16 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"embed"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"mime"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +31,8 @@ import (
 	workspacepreview "github.com/pengmide/lumi/internal/workspace"
 )
 
+const outputRuleWidth = 50
+
 // Server is the HTTP server
 type Server struct {
 	config         *config.Config
@@ -41,7 +46,7 @@ type Server struct {
 	workspaceDiffs *workspacepreview.ChangesService
 	skills         *skills.Registry
 	devices        *device.Registry
-	sandbox        *sandbox.Manager
+	sandbox        sandboxManager
 	staticFS       fs.FS
 	wechat         *wechat.Service
 	wechatChat     *wechatChatRuntime
@@ -73,6 +78,15 @@ type Server struct {
 	setupMu     sync.RWMutex
 	setupSubs   map[chan setupcheck.SetupStatus]struct{}
 	setupSubsMu sync.RWMutex
+}
+
+type sandboxManager interface {
+	Ensure(context.Context, sandbox.EnsureOptions) (sandbox.RuntimeState, *sandbox.RuntimeError)
+	KeepAlive(config.WorkspaceConfig)
+	Preflight(context.Context, sandbox.PreflightRequest) sandbox.PreflightResponse
+	ShutdownPreserveContainers() error
+	Status(config.WorkspaceConfig) sandbox.RuntimeState
+	Terminate(context.Context, string) error
 }
 
 // NewServer creates a new HTTP server
@@ -231,31 +245,73 @@ func (s *Server) Handler() http.Handler {
 	return recoveryMiddleware(corsMiddleware(mux))
 }
 
-// Shutdown stops all agents
+// Shutdown stops all services while preserving sandbox containers for recovery.
 func (s *Server) Shutdown() error {
-	if err := s.wechat.Stop(); err != nil {
-		return err
-	}
-	if err := s.wechatChat.Shutdown(); err != nil {
-		return err
-	}
-	if err := s.wecom.Stop(); err != nil {
-		return err
-	}
-	if err := s.wecomChat.Shutdown(); err != nil {
-		return err
-	}
-	if err := s.workspaceDiffs.DisposeAll(); err != nil {
-		return err
-	}
-	if err := s.sandbox.Shutdown(); err != nil {
-		return err
-	}
-	if s.cron != nil {
-		s.cron.Stop()
+	steps := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "Stopping WeChat service...", run: func() error {
+			if s.wechat != nil {
+				return s.wechat.Stop()
+			}
+			return nil
+		}},
+		{name: "Stopping WeChat agents...", run: func() error {
+			if s.wechatChat != nil {
+				return s.wechatChat.Shutdown()
+			}
+			return nil
+		}},
+		{name: "Stopping WeCom service...", run: func() error {
+			if s.wecom != nil {
+				return s.wecom.Stop()
+			}
+			return nil
+		}},
+		{name: "Stopping WeCom agents...", run: func() error {
+			if s.wecomChat != nil {
+				return s.wecomChat.Shutdown()
+			}
+			return nil
+		}},
+		{name: "Disposing workspace diff state...", run: func() error {
+			if s.workspaceDiffs != nil {
+				return s.workspaceDiffs.DisposeAll()
+			}
+			return nil
+		}},
+		{name: "Stopping sandbox manager (containers preserved)...", run: func() error {
+			if s.sandbox != nil {
+				return s.sandbox.ShutdownPreserveContainers()
+			}
+			return nil
+		}},
+		{name: "Stopping cron scheduler...", run: func() error {
+			if s.cron != nil {
+				s.cron.Stop()
+			}
+			return nil
+		}},
+		{name: "Stopping local agents...", run: func() error {
+			if s.agents != nil {
+				return s.agents.Shutdown()
+			}
+			return nil
+		}},
 	}
 
-	return s.agents.Shutdown()
+	fmt.Fprintln(os.Stderr, "\n⏳ Shutdown")
+	fmt.Fprintln(os.Stderr, strings.Repeat("─", outputRuleWidth))
+	for _, step := range steps {
+		fmt.Fprintf(os.Stderr, "   %s\n", step.name)
+		if err := step.run(); err != nil {
+			fmt.Fprintf(os.Stderr, "   %s failed: %v\n", step.name, err)
+			return err
+		}
+	}
+	fmt.Fprintln(os.Stderr, "   Shutdown complete.")
+	return nil
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

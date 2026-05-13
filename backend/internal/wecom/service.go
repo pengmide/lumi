@@ -113,12 +113,16 @@ func (s *Service) Stop() error {
 	done := s.monitorDone
 	s.monitorCancel = nil
 	s.monitorDone = nil
+	rt := s.runtime
 	s.runtime = nil
 	s.running = false
 	s.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if rt != nil {
+		_ = rt.close()
 	}
 	if done != nil {
 		<-done

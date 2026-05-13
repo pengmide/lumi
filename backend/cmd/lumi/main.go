@@ -69,7 +69,6 @@ func main() {
 
 	go func() {
 		<-sigCh
-		fmt.Println("\nShutting down...")
 		done := make(chan error, 1)
 		go func() {
 			done <- server.Shutdown()

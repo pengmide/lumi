@@ -236,6 +236,10 @@ func (rt *wsRuntime) runConnection(ctx context.Context) error {
 	heartCtx, heartCancel := context.WithCancel(ctx)
 	defer heartCancel()
 	go rt.heartbeat(heartCtx, conn)
+	go func() {
+		<-ctx.Done()
+		_ = rt.close()
+	}()
 
 	for {
 		select {

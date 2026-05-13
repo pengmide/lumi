@@ -37,7 +37,7 @@ type Manager struct {
 	config  *config.Config
 	devices *device.Registry
 	store   *Store
-	docker  *sandboxdocker.Client
+	docker  dockerClient
 
 	runtimeDir string
 
@@ -45,8 +45,9 @@ type Manager struct {
 	runtimes map[string]*RuntimeRecord
 	ensures  map[string]*ensureResult
 
-	stop chan struct{}
-	done chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 func NewManager(cfg *config.Config, devices *device.Registry) (*Manager, error) {
@@ -74,14 +75,15 @@ func NewManager(cfg *config.Config, devices *device.Registry) (*Manager, error) 
 }
 
 func (m *Manager) Shutdown() error {
-	close(m.stop)
-	<-m.done
+	return m.ShutdownPreserveContainers()
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := m.TerminateAll(ctx); err != nil {
-		_ = m.docker.Close()
-		return err
+func (m *Manager) ShutdownPreserveContainers() error {
+	m.stopOnce.Do(func() {
+		close(m.stop)
+	})
+	if m.done != nil {
+		<-m.done
 	}
 	return m.docker.Close()
 }
