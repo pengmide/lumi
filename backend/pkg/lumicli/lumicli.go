@@ -14,6 +14,7 @@ import (
 	"github.com/pengmide/lumi/internal/device"
 	"github.com/pengmide/lumi/internal/sandbox"
 	"github.com/pengmide/lumi/internal/setupcheck"
+	"github.com/pengmide/lumi/internal/wechat"
 	"github.com/pengmide/lumi/internal/wecom"
 )
 
@@ -28,6 +29,18 @@ type RunOptions struct {
 	AgentID        string
 	BotID          string
 	BotSecret      string
+	Port           string
+	IdleTimeoutSec int
+}
+
+type WeChatRunOptions struct {
+	ConfigPath     string
+	Workspace      string
+	Kind           string
+	AgentID        string
+	AccountID      string
+	BotToken       string
+	BaseURL        string
 	Port           string
 	IdleTimeoutSec int
 }
@@ -161,42 +174,120 @@ func InstallSetup(status SetupStatus, progress func(SetupInstallEvent), logFn fu
 }
 
 func PrepareRun(state *ConfigState, opts RunOptions) (*config.Config, string, error) {
+	cfg, workspacePath, workspaceID, agentID, err := prepareIMRunWorkspace(state, imRunWorkspaceOptions{
+		Workspace:      opts.Workspace,
+		Kind:           opts.Kind,
+		AgentID:        opts.AgentID,
+		Port:           opts.Port,
+		IdleTimeoutSec: opts.IdleTimeoutSec,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	wecomCfg := wecom.Config{
+		Enabled:             true,
+		Mode:                "websocket",
+		BotID:               strings.TrimSpace(opts.BotID),
+		BotSecret:           strings.TrimSpace(opts.BotSecret),
+		WorkspaceID:         workspaceID,
+		AgentID:             agentID,
+		ConnectTimeoutMs:    15000,
+		HeartbeatIntervalMs: 30000,
+		MessageAckTimeoutMs: 5000,
+	}
+	if strings.TrimSpace(wecomCfg.BotID) == "" {
+		return nil, "", errors.New("bot id is required")
+	}
+	if strings.TrimSpace(wecomCfg.BotSecret) == "" {
+		return nil, "", errors.New("bot secret is required")
+	}
+	if err := wecom.NewConfigStore().Save(wecomCfg); err != nil {
+		return nil, "", err
+	}
+
+	return cfg, workspacePath, nil
+}
+
+func PrepareWeChatRun(state *ConfigState, opts WeChatRunOptions) (*config.Config, string, error) {
+	cfg, workspacePath, workspaceID, agentID, err := prepareIMRunWorkspace(state, imRunWorkspaceOptions{
+		Workspace:      opts.Workspace,
+		Kind:           opts.Kind,
+		AgentID:        opts.AgentID,
+		Port:           opts.Port,
+		IdleTimeoutSec: opts.IdleTimeoutSec,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	wechatCfg := wechat.Config{
+		Enabled:     true,
+		LoginMode:   "qr",
+		AccountID:   strings.TrimSpace(opts.AccountID),
+		BotToken:    strings.TrimSpace(opts.BotToken),
+		BaseURL:     strings.TrimSpace(opts.BaseURL),
+		WorkspaceID: workspaceID,
+		AgentID:     agentID,
+	}
+	if strings.TrimSpace(wechatCfg.AccountID) == "" {
+		return nil, "", errors.New("account id is required")
+	}
+	if strings.TrimSpace(wechatCfg.BotToken) == "" {
+		return nil, "", errors.New("bot token is required")
+	}
+	if err := wechat.NewConfigStore().Save(wechatCfg); err != nil {
+		return nil, "", err
+	}
+
+	return cfg, workspacePath, nil
+}
+
+type imRunWorkspaceOptions struct {
+	Workspace      string
+	Kind           string
+	AgentID        string
+	Port           string
+	IdleTimeoutSec int
+}
+
+func prepareIMRunWorkspace(state *ConfigState, opts imRunWorkspaceOptions) (*config.Config, string, string, string, error) {
 	if state == nil || state.Config == nil {
-		return nil, "", errors.New("config state is required")
+		return nil, "", "", "", errors.New("config state is required")
 	}
 	cfg := state.Config
 	if len(cfg.Agents) == 0 {
-		return nil, "", errors.New("no agents configured; run `lumi setup` first and prepare agents in lumi.config.json")
+		return nil, "", "", "", errors.New("no agents configured; run `lumi setup` first and prepare agents in lumi.config.json")
 	}
 
 	workspacePath, err := filepath.Abs(strings.TrimSpace(opts.Workspace))
 	if err != nil {
-		return nil, "", fmt.Errorf("resolve workspace: %w", err)
+		return nil, "", "", "", fmt.Errorf("resolve workspace: %w", err)
 	}
 	info, err := os.Stat(workspacePath)
 	if err != nil {
-		return nil, "", fmt.Errorf("workspace not found: %w", err)
+		return nil, "", "", "", fmt.Errorf("workspace not found: %w", err)
 	}
 	if !info.IsDir() {
-		return nil, "", errors.New("workspace must be a directory")
+		return nil, "", "", "", errors.New("workspace must be a directory")
 	}
 	kind := strings.TrimSpace(opts.Kind)
 	if kind == "" {
 		kind = "local"
 	}
 	if kind != "local" && kind != "sandbox" {
-		return nil, "", errors.New("kind must be local or sandbox")
+		return nil, "", "", "", errors.New("kind must be local or sandbox")
 	}
 	if opts.IdleTimeoutSec < 0 {
-		return nil, "", errors.New("idle timeout sec must be non-negative")
+		return nil, "", "", "", errors.New("idle timeout sec must be non-negative")
 	}
 
 	agentID := strings.TrimSpace(opts.AgentID)
 	if agentID == "" {
-		return nil, "", errors.New("agent is required")
+		return nil, "", "", "", errors.New("agent is required")
 	}
 	if cfg.FindAgent(agentID) == nil {
-		return nil, "", fmt.Errorf("agent not found: %s; run `lumi setup` first and configure it in lumi.config.json", agentID)
+		return nil, "", "", "", fmt.Errorf("agent not found: %s; run `lumi setup` first and configure it in lumi.config.json", agentID)
 	}
 
 	workspaceName := filepath.Base(workspacePath)
@@ -227,7 +318,7 @@ func PrepareRun(state *ConfigState, opts RunOptions) (*config.Config, string, er
 	cfg.DefaultWorkspace = workspaceID
 
 	if err := cfg.Validate(); err != nil {
-		return nil, "", err
+		return nil, "", "", "", err
 	}
 	if strings.TrimSpace(cfg.PublicServerURL) == "" {
 		port := strings.TrimSpace(opts.Port)
@@ -237,31 +328,10 @@ func PrepareRun(state *ConfigState, opts RunOptions) (*config.Config, string, er
 		cfg.PublicServerURL = "http://127.0.0.1:" + strings.TrimPrefix(port, ":")
 	}
 	if err := saveConfig(cfg, state.Path); err != nil {
-		return nil, "", err
+		return nil, "", "", "", err
 	}
 
-	wecomCfg := wecom.Config{
-		Enabled:             true,
-		Mode:                "websocket",
-		BotID:               strings.TrimSpace(opts.BotID),
-		BotSecret:           strings.TrimSpace(opts.BotSecret),
-		WorkspaceID:         workspaceID,
-		AgentID:             agentID,
-		ConnectTimeoutMs:    15000,
-		HeartbeatIntervalMs: 30000,
-		MessageAckTimeoutMs: 5000,
-	}
-	if strings.TrimSpace(wecomCfg.BotID) == "" {
-		return nil, "", errors.New("bot id is required")
-	}
-	if strings.TrimSpace(wecomCfg.BotSecret) == "" {
-		return nil, "", errors.New("bot secret is required")
-	}
-	if err := wecom.NewConfigStore().Save(wecomCfg); err != nil {
-		return nil, "", err
-	}
-
-	return cfg, workspacePath, nil
+	return cfg, workspacePath, workspaceID, agentID, nil
 }
 
 func StartServer(cfg *config.Config, staticFS fs.FS, port string) (*ServerRuntime, error) {

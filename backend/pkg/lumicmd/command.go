@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,10 +19,20 @@ import (
 	"syscall"
 	"time"
 
+	qrcode "github.com/skip2/go-qrcode"
+
+	"github.com/pengmide/lumi/internal/config"
+	"github.com/pengmide/lumi/internal/wechat"
 	"github.com/pengmide/lumi/pkg/lumicli"
 )
 
 var pruneSandboxes = lumicli.PruneSandboxes
+var startServer = func(cfg *config.Config, staticFS fs.FS, port string) (serverRuntime, error) {
+	return lumicli.StartServer(cfg, staticFS, port)
+}
+var newWeChatLoginClient = func(baseURL string) wechatLoginClient {
+	return wechat.NewLoginClient(baseURL)
+}
 
 func Run(args []string, stdin *os.File, stdout, stderr *os.File) error {
 	return RunAs("lumi", args, stdin, stdout, stderr)
@@ -44,6 +55,8 @@ func RunAs(programName string, args []string, stdin *os.File, stdout, stderr *os
 		return runSandbox(args[1:], stdout, programName)
 	case "setup":
 		return runSetup(args[1:], stdin, stdout)
+	case "wechat":
+		return runWeChat(args[1:], stdout, stderr, programName)
 	case "wecom":
 		return runWeCom(args[1:], stdin, stdout, stderr, programName)
 	case "-h", "--help", "help":
@@ -52,6 +65,23 @@ func RunAs(programName string, args []string, stdin *os.File, stdout, stderr *os
 	default:
 		return fmt.Errorf("unknown command: %s", args[0])
 	}
+}
+
+type wechatLoginClient interface {
+	GetQRCode(context.Context) (wechat.QRCode, error)
+	GetQRCodeStatus(context.Context, string) (wechat.QRCodeStatus, error)
+}
+
+type wechatRunCredentials struct {
+	AccountID string
+	BotToken  string
+	BaseURL   string
+}
+
+type serverRuntime interface {
+	ListenAndServe() error
+	ShutdownWithContext(context.Context) error
+	Port() string
 }
 
 type cronSchedulePayload struct {
@@ -618,6 +648,187 @@ func runSetup(args []string, stdin *os.File, stdout *os.File) error {
 	return nil
 }
 
+func runWeChat(args []string, stdout, stderr *os.File, programName string) error {
+	if len(args) == 0 {
+		printWeChatUsage(stdout, programName)
+		return nil
+	}
+
+	switch args[0] {
+	case "run":
+		return runWeChatRun(args[1:], stdout, stderr)
+	case "-h", "--help", "help":
+		printWeChatUsage(stdout, programName)
+		return nil
+	default:
+		return fmt.Errorf("unknown wechat command: %s", args[0])
+	}
+}
+
+func runWeChatRun(args []string, stdout, stderr *os.File) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+
+	configPath := fs.String("config", "", "Config file path")
+	workspace := fs.String("workspace", envOrDefault("LUMI_WORKSPACE", ""), "Local workspace path")
+	kind := fs.String("kind", envOrDefault("LUMI_WORKSPACE_KIND", "local"), "Workspace kind: local or sandbox")
+	agentID := fs.String("agent", envOrDefault("LUMI_AGENT", ""), "Configured agent ID")
+	baseURL := fs.String("base-url", envOrDefault("LUMI_WECHAT_BASE_URL", ""), "WeChat login API base URL")
+	port := fs.String("port", envOrDefault("LUMI_PORT", "3000"), "Server port")
+	idleTimeoutSec := fs.Int("idle-timeout-sec", 0, "Sandbox idle timeout in seconds for IM CLI runs; defaults to 10 years")
+	loginTimeoutSec := fs.Int("login-timeout-sec", 300, "WeChat QR login timeout in seconds")
+	forceLogin := fs.Bool("force-login", false, "Force WeChat QR login even when saved credentials exist")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	state, err := lumicli.ResolveConfigState(*configPath)
+	if err != nil {
+		return err
+	}
+	if !state.Exists || !state.HasAgents {
+		return errors.New("no agents configured; run `lumi setup` first, then prepare agents in lumi.config.json")
+	}
+
+	if strings.TrimSpace(*workspace) == "" || strings.TrimSpace(*agentID) == "" {
+		return errors.New("wechat run requires --workspace and --agent")
+	}
+	if *loginTimeoutSec <= 0 {
+		return errors.New("login timeout sec must be positive")
+	}
+
+	loginCtx, stopLoginSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	credentials, reusedLogin, err := resolveWeChatRunCredentials(loginCtx, stdout, strings.TrimSpace(*baseURL), time.Duration(*loginTimeoutSec)*time.Second, *forceLogin)
+	stopLoginSignals()
+	if err != nil {
+		return err
+	}
+
+	cfg, workspacePath, err := lumicli.PrepareWeChatRun(state, lumicli.WeChatRunOptions{
+		ConfigPath:     *configPath,
+		Workspace:      *workspace,
+		Kind:           *kind,
+		AgentID:        *agentID,
+		AccountID:      credentials.AccountID,
+		BotToken:       credentials.BotToken,
+		BaseURL:        credentials.BaseURL,
+		Port:           *port,
+		IdleTimeoutSec: *idleTimeoutSec,
+	})
+	if err != nil {
+		return err
+	}
+
+	runtime, err := startServer(cfg, nil, *port)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Config file: %s\n", state.Path)
+	fmt.Fprintf(stdout, "Workspace: %s\n", workspacePath)
+	fmt.Fprintf(stdout, "Workspace kind: %s\n", strings.TrimSpace(*kind))
+	fmt.Fprintf(stdout, "Agent: %s\n", *agentID)
+	fmt.Fprintf(stdout, "Server: http://localhost:%s\n", runtime.Port())
+	if reusedLogin {
+		fmt.Fprintf(stdout, "WeChat: using saved account %s\n", credentials.AccountID)
+	} else {
+		fmt.Fprintf(stdout, "WeChat: enabled for account %s\n", credentials.AccountID)
+	}
+	fmt.Fprintln(stdout, "Agent credentials are inherited from the current shell environment or existing config env.")
+
+	return serveRuntimeUntilSignal(runtime, stdout, stderr)
+}
+
+func resolveWeChatRunCredentials(parent context.Context, stdout *os.File, baseURL string, timeout time.Duration, forceLogin bool) (wechatRunCredentials, bool, error) {
+	baseURL = strings.TrimSpace(baseURL)
+	store := wechat.NewConfigStore()
+	saved, err := store.Load()
+	if err != nil {
+		return wechatRunCredentials{}, false, err
+	}
+	if baseURL == "" {
+		baseURL = saved.BaseURL
+	}
+	if !forceLogin && strings.TrimSpace(saved.AccountID) != "" && strings.TrimSpace(saved.BotToken) != "" {
+		if baseURL == "" {
+			baseURL = saved.BaseURL
+		}
+		return wechatRunCredentials{
+			AccountID: strings.TrimSpace(saved.AccountID),
+			BotToken:  strings.TrimSpace(saved.BotToken),
+			BaseURL:   baseURL,
+		}, true, nil
+	}
+
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	credentials, err := performWeChatQRLogin(ctx, stdout, baseURL)
+	return credentials, false, err
+}
+
+func performWeChatQRLogin(ctx context.Context, stdout *os.File, baseURL string) (wechatRunCredentials, error) {
+	client := newWeChatLoginClient(baseURL)
+	qr, err := client.GetQRCode(ctx)
+	if err != nil {
+		return wechatRunCredentials{}, err
+	}
+	if err := printTerminalQRCode(stdout, qr.ImageURL); err != nil {
+		fmt.Fprintf(stdout, "QR render failed: %v\n", err)
+	}
+	fmt.Fprintln(stdout, "Scan this WeChat QR code to log in.")
+	fmt.Fprintf(stdout, "Ticket: %s\n", qr.Ticket)
+	fmt.Fprintf(stdout, "URL: %s\n", qr.ImageURL)
+
+	scanned := false
+	for {
+		status, err := client.GetQRCodeStatus(ctx, qr.Ticket)
+		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return wechatRunCredentials{}, errors.New("wechat qr login timed out")
+			}
+			if ctx.Err() != nil {
+				return wechatRunCredentials{}, ctx.Err()
+			}
+			return wechatRunCredentials{}, err
+		}
+		switch status.Status {
+		case "wait", "":
+		case "scaned":
+			if !scanned {
+				fmt.Fprintln(stdout, "Scanned; waiting for confirmation...")
+				scanned = true
+			}
+		case "confirmed":
+			accountID := strings.TrimSpace(status.AccountID)
+			botToken := strings.TrimSpace(status.BotToken)
+			if accountID == "" || botToken == "" {
+				return wechatRunCredentials{}, errors.New("wechat qr login confirmed but credentials are incomplete")
+			}
+			return wechatRunCredentials{
+				AccountID: accountID,
+				BotToken:  botToken,
+				BaseURL:   strings.TrimSpace(status.BaseURL),
+			}, nil
+		case "expired":
+			return wechatRunCredentials{}, errors.New("wechat qr code expired; rerun `lumi wechat run` to scan a new code")
+		default:
+			return wechatRunCredentials{}, fmt.Errorf("unexpected wechat qr status: %s", status.Status)
+		}
+	}
+}
+
+func printTerminalQRCode(stdout *os.File, value string) error {
+	qr, err := qrcode.New(value, qrcode.Medium)
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(stdout, qr.ToSmallString(false))
+	return nil
+}
+
 func runWeCom(args []string, _ *os.File, stdout, stderr *os.File, programName string) error {
 	if len(args) == 0 {
 		printWeComUsage(stdout, programName)
@@ -680,7 +891,7 @@ func runWeComRun(args []string, stdout, stderr *os.File) error {
 		return err
 	}
 
-	runtime, err := lumicli.StartServer(cfg, nil, *port)
+	runtime, err := startServer(cfg, nil, *port)
 	if err != nil {
 		return err
 	}
@@ -693,8 +904,13 @@ func runWeComRun(args []string, stdout, stderr *os.File) error {
 	fmt.Fprintf(stdout, "WeCom: enabled for bot %s\n", *botID)
 	fmt.Fprintln(stdout, "Agent credentials are inherited from the current shell environment or existing config env.")
 
+	return serveRuntimeUntilSignal(runtime, stdout, stderr)
+}
+
+func serveRuntimeUntilSignal(runtime serverRuntime, stdout, stderr *os.File) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runtime.ListenAndServe()
@@ -745,6 +961,7 @@ func printUsage(stdout *os.File, programName string) {
 	fmt.Fprintf(stdout, "  %s cron <command> [flags]\n", programName)
 	fmt.Fprintf(stdout, "  %s sandbox <command> [flags]\n", programName)
 	fmt.Fprintf(stdout, "  %s setup [flags]\n", programName)
+	fmt.Fprintf(stdout, "  %s wechat <command> [flags]\n", programName)
 	fmt.Fprintf(stdout, "  %s wecom <command> [flags]\n", programName)
 	fmt.Fprintln(stdout, "")
 	fmt.Fprintln(stdout, "setup checks and optionally installs runtime dependencies. It does not create agents or manage API keys.")
@@ -762,6 +979,11 @@ func printCronUsage(stdout *os.File, programName string) {
 func printWeComUsage(stdout *os.File, programName string) {
 	fmt.Fprintln(stdout, "Usage:")
 	fmt.Fprintf(stdout, "  %s wecom run --workspace <path> --kind local|sandbox --agent <id> --bot-id <id> --bot-secret <secret> [--idle-timeout-sec <seconds>] [flags]\n", programName)
+}
+
+func printWeChatUsage(stdout *os.File, programName string) {
+	fmt.Fprintln(stdout, "Usage:")
+	fmt.Fprintf(stdout, "  %s wechat run --workspace <path> --kind local|sandbox --agent <id> [--base-url <url>] [--force-login] [--login-timeout-sec <seconds>] [--idle-timeout-sec <seconds>] [flags]\n", programName)
 }
 
 func printSandboxUsage(stdout *os.File, programName string) {
@@ -819,7 +1041,7 @@ func printAgentGuidance(stdout *os.File, state *lumicli.ConfigState) {
 		return
 	}
 	fmt.Fprintf(stdout, "可用 agents: %s\n", strings.Join(lumicli.AgentIDs(state), ", "))
-	fmt.Fprintln(stdout, "lumi wecom run 会直接复用这些 agent 定义。")
+	fmt.Fprintln(stdout, "lumi wechat run / lumi wecom run 会直接复用这些 agent 定义。")
 }
 
 func promptYesNo(reader *bufio.Reader, stdout *os.File, label string, defaultYes bool) (bool, error) {

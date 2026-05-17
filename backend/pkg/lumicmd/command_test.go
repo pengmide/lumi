@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/pengmide/lumi/internal/config"
+	"github.com/pengmide/lumi/internal/wechat"
 	"github.com/pengmide/lumi/pkg/lumicli"
 )
 
@@ -102,6 +104,180 @@ func TestWeComRunParsesIdleTimeoutFlag(t *testing.T) {
 	}, stdout, stderr)
 	if err == nil || !strings.Contains(err.Error(), "idle timeout sec must be non-negative") {
 		t.Fatalf("runWeComRun() error = %v, want idle timeout validation", err)
+	}
+}
+
+func TestWeChatRunUsesSavedCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := createCLIConfigWithAgent(t, home)
+	if err := wechat.NewConfigStore().Save(wechat.Config{
+		Enabled:   true,
+		LoginMode: "qr",
+		AccountID: "wx-saved",
+		BotToken:  "saved-token",
+		BaseURL:   "https://saved.test",
+	}); err != nil {
+		t.Fatalf("Save(wechat) error = %v", err)
+	}
+
+	originalStartServer := startServer
+	originalLoginClient := newWeChatLoginClient
+	defer func() {
+		startServer = originalStartServer
+		newWeChatLoginClient = originalLoginClient
+	}()
+	startServer = func(cfg *config.Config, staticFS fs.FS, port string) (serverRuntime, error) {
+		return &fakeServerRuntime{port: port}, nil
+	}
+	newWeChatLoginClient = func(baseURL string) wechatLoginClient {
+		t.Fatalf("newWeChatLoginClient called for saved credentials")
+		return nil
+	}
+
+	stdout, stderr := tempStdoutStderr(t)
+	if err := runWeChatRun([]string{
+		"--workspace", workspace,
+		"--agent", "claude",
+		"--port", "3456",
+	}, stdout, stderr); err != nil {
+		t.Fatalf("runWeChatRun() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".lumi", "wechat", "config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(wechat) error = %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"accountId": "wx-saved"`) || !strings.Contains(text, `"workspaceId": "cli-local"`) {
+		t.Fatalf("wechat config = %s, want saved account with cli workspace", text)
+	}
+	if !stdoutContains(t, stdout, "WeChat: using saved account wx-saved") {
+		t.Fatalf("stdout missing saved account message")
+	}
+}
+
+func TestWeChatRunForceLoginScansAndStarts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := createCLIConfigWithAgent(t, home)
+	if err := wechat.NewConfigStore().Save(wechat.Config{
+		AccountID: "wx-old",
+		BotToken:  "old-token",
+		BaseURL:   "https://old.test",
+	}); err != nil {
+		t.Fatalf("Save(wechat) error = %v", err)
+	}
+
+	originalStartServer := startServer
+	originalLoginClient := newWeChatLoginClient
+	defer func() {
+		startServer = originalStartServer
+		newWeChatLoginClient = originalLoginClient
+	}()
+	startServer = func(cfg *config.Config, staticFS fs.FS, port string) (serverRuntime, error) {
+		return &fakeServerRuntime{port: port}, nil
+	}
+	fakeLogin := &fakeWeChatLoginClient{
+		qr: wechat.QRCode{Ticket: "ticket-1", ImageURL: "https://img.test/1"},
+		statuses: []wechat.QRCodeStatus{
+			{Status: "wait"},
+			{Status: "scaned"},
+			{Status: "confirmed", AccountID: "wx-new", BotToken: "new-token", BaseURL: "https://new.test/"},
+		},
+	}
+	newWeChatLoginClient = func(baseURL string) wechatLoginClient {
+		if baseURL != "https://old.test" {
+			t.Fatalf("baseURL = %q, want saved base", baseURL)
+		}
+		return fakeLogin
+	}
+
+	stdout, stderr := tempStdoutStderr(t)
+	if err := runWeChatRun([]string{
+		"--workspace", workspace,
+		"--agent", "claude",
+		"--force-login",
+	}, stdout, stderr); err != nil {
+		t.Fatalf("runWeChatRun(force) error = %v", err)
+	}
+	if fakeLogin.statusCalls != 3 {
+		t.Fatalf("status calls = %d, want 3", fakeLogin.statusCalls)
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".lumi", "wechat", "config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(wechat) error = %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"accountId": "wx-new"`) || !strings.Contains(text, `"botToken": "new-token"`) || !strings.Contains(text, `"baseUrl": "https://new.test"`) {
+		t.Fatalf("wechat config = %s, want new credentials", text)
+	}
+	if !stdoutContains(t, stdout, "Scanned; waiting for confirmation") || !stdoutContains(t, stdout, "Ticket: ticket-1") {
+		t.Fatalf("stdout missing QR login progress")
+	}
+}
+
+func TestWeChatRunExpiredDoesNotOverwriteSavedCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := createCLIConfigWithAgent(t, home)
+	if err := wechat.NewConfigStore().Save(wechat.Config{
+		AccountID: "wx-old",
+		BotToken:  "old-token",
+		BaseURL:   "https://old.test",
+	}); err != nil {
+		t.Fatalf("Save(wechat) error = %v", err)
+	}
+
+	originalLoginClient := newWeChatLoginClient
+	defer func() { newWeChatLoginClient = originalLoginClient }()
+	newWeChatLoginClient = func(baseURL string) wechatLoginClient {
+		return &fakeWeChatLoginClient{
+			qr:       wechat.QRCode{Ticket: "ticket-1", ImageURL: "https://img.test/1"},
+			statuses: []wechat.QRCodeStatus{{Status: "expired"}},
+		}
+	}
+
+	stdout, stderr := tempStdoutStderr(t)
+	err := runWeChatRun([]string{
+		"--workspace", workspace,
+		"--agent", "claude",
+		"--force-login",
+	}, stdout, stderr)
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("runWeChatRun(expired) error = %v, want expired", err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".lumi", "wechat", "config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(wechat) error = %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"accountId": "wx-old"`) || !strings.Contains(text, `"botToken": "old-token"`) {
+		t.Fatalf("wechat config overwritten after expired login: %s", text)
+	}
+}
+
+func TestWeChatCommandUsageAndUnknownCommand(t *testing.T) {
+	stdout, err := tempOutputFile(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdout.Close()
+	stderr, err := tempOutputFile(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+
+	if err := runWeChat(nil, stdout, stderr, "lumi"); err != nil {
+		t.Fatalf("runWeChat(nil) error = %v", err)
+	}
+	if !stdoutContains(t, stdout, "lumi wechat run") {
+		t.Fatalf("stdout missing wechat usage")
+	}
+	err = runWeChat([]string{"missing"}, stdout, stderr, "lumi")
+	if err == nil || !strings.Contains(err.Error(), "unknown wechat command") {
+		t.Fatalf("runWeChat(missing) error = %v, want unknown command", err)
 	}
 }
 
@@ -209,4 +385,102 @@ func TestSandboxCommandUsageAndUnknownCommand(t *testing.T) {
 func tempOutputFile(t *testing.T) (*os.File, error) {
 	t.Helper()
 	return os.CreateTemp(t.TempDir(), "stdout")
+}
+
+func tempStdoutStderr(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	stdout, err := tempOutputFile(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := tempOutputFile(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+	})
+	return stdout, stderr
+}
+
+func stdoutContains(t *testing.T, stdout *os.File, want string) bool {
+	t.Helper()
+	if _, err := stdout.Seek(0, 0); err != nil {
+		t.Fatalf("Seek(stdout) error = %v", err)
+	}
+	data, err := io.ReadAll(stdout)
+	if err != nil {
+		t.Fatalf("ReadAll(stdout) error = %v", err)
+	}
+	return strings.Contains(string(data), want)
+}
+
+func createCLIConfigWithAgent(t *testing.T, home string) string {
+	t.Helper()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatalf("MkdirAll(workspace) error = %v", err)
+	}
+	state, err := lumicli.ResolveConfigState("")
+	if err != nil {
+		t.Fatalf("ResolveConfigState() error = %v", err)
+	}
+	if err := lumicli.EnsureConfigFile(state); err != nil {
+		t.Fatalf("EnsureConfigFile() error = %v", err)
+	}
+	state.Config.Agents = []config.AgentConfig{
+		{ID: "claude", Name: "Claude Code", Command: "npx"},
+	}
+	state.Config.DefaultAgent = "claude"
+	if err := state.Config.Save(state.Path); err != nil {
+		t.Fatalf("Save(config) error = %v", err)
+	}
+	return workspace
+}
+
+type fakeServerRuntime struct {
+	port string
+}
+
+func (r *fakeServerRuntime) ListenAndServe() error {
+	return nil
+}
+
+func (r *fakeServerRuntime) ShutdownWithContext(context.Context) error {
+	return nil
+}
+
+func (r *fakeServerRuntime) Port() string {
+	if r.port == "" {
+		return "3000"
+	}
+	return r.port
+}
+
+type fakeWeChatLoginClient struct {
+	qr          wechat.QRCode
+	statuses    []wechat.QRCodeStatus
+	statusCalls int
+	err         error
+}
+
+func (c *fakeWeChatLoginClient) GetQRCode(context.Context) (wechat.QRCode, error) {
+	if c.err != nil {
+		return wechat.QRCode{}, c.err
+	}
+	return c.qr, nil
+}
+
+func (c *fakeWeChatLoginClient) GetQRCodeStatus(context.Context, string) (wechat.QRCodeStatus, error) {
+	if c.err != nil {
+		return wechat.QRCodeStatus{}, c.err
+	}
+	c.statusCalls++
+	if len(c.statuses) == 0 {
+		return wechat.QRCodeStatus{Status: "wait"}, nil
+	}
+	status := c.statuses[0]
+	c.statuses = c.statuses[1:]
+	return status, nil
 }

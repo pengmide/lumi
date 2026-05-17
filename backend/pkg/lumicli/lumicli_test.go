@@ -2,6 +2,7 @@ package lumicli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/pengmide/lumi/internal/config"
 	"github.com/pengmide/lumi/internal/sandbox"
+	"github.com/pengmide/lumi/internal/wechat"
 )
 
 func TestEnsureConfigFileCreatesExampleConfig(t *testing.T) {
@@ -324,6 +326,70 @@ func TestPrepareRunIgnoresIdleTimeoutForLocalWorkspace(t *testing.T) {
 	}
 	if ws.IdleTimeoutSec != 0 {
 		t.Fatalf("local idle timeout = %d, want 0", ws.IdleTimeoutSec)
+	}
+}
+
+func TestPrepareWeChatRunSavesConfigAndWorkspace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	state, err := ResolveConfigState("")
+	if err != nil {
+		t.Fatalf("ResolveConfigState() error = %v", err)
+	}
+	if err := EnsureConfigFile(state); err != nil {
+		t.Fatalf("EnsureConfigFile() error = %v", err)
+	}
+	state.Config.Agents = []config.AgentConfig{
+		{ID: "claude", Name: "Claude Code", Command: "npx"},
+	}
+	state.Config.DefaultAgent = "claude"
+	if err := saveConfig(state.Config, state.Path); err != nil {
+		t.Fatalf("saveConfig() error = %v", err)
+	}
+	state.HasAgents = true
+
+	cfg, resolved, err := PrepareWeChatRun(state, WeChatRunOptions{
+		Workspace: workspace,
+		Kind:      "sandbox",
+		AgentID:   "claude",
+		AccountID: "wx-bot",
+		BotToken:  "bot-token",
+		BaseURL:   "https://wechat.test/",
+		Port:      "4455",
+	})
+	if err != nil {
+		t.Fatalf("PrepareWeChatRun() error = %v", err)
+	}
+	if resolved != workspace {
+		t.Fatalf("resolved workspace = %q, want %q", resolved, workspace)
+	}
+	if cfg.DefaultWorkspace != SandboxWorkspaceID {
+		t.Fatalf("default workspace = %q, want %q", cfg.DefaultWorkspace, SandboxWorkspaceID)
+	}
+	ws := cfg.FindWorkspace(SandboxWorkspaceID)
+	if ws == nil || ws.Kind != "sandbox" || ws.Agents[0] != "claude" {
+		t.Fatalf("sandbox workspace = %+v, want claude sandbox", ws)
+	}
+	if cfg.PublicServerURL != "http://127.0.0.1:4455" {
+		t.Fatalf("public server URL = %q, want http://127.0.0.1:4455", cfg.PublicServerURL)
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".lumi", "wechat", "config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(wechat) error = %v", err)
+	}
+	var saved wechat.Config
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("Unmarshal(wechat) error = %v", err)
+	}
+	if !saved.Enabled || saved.LoginMode != "qr" || saved.AccountID != "wx-bot" || saved.BotToken != "bot-token" ||
+		saved.BaseURL != "https://wechat.test" || saved.WorkspaceID != SandboxWorkspaceID || saved.AgentID != "claude" {
+		t.Fatalf("wechat config = %+v, want saved QR credentials", saved)
 	}
 }
 

@@ -82,6 +82,7 @@ type Server struct {
 
 type sandboxManager interface {
 	Ensure(context.Context, sandbox.EnsureOptions) (sandbox.RuntimeState, *sandbox.RuntimeError)
+	HasActiveRuntime() bool
 	KeepAlive(config.WorkspaceConfig)
 	Preflight(context.Context, sandbox.PreflightRequest) sandbox.PreflightResponse
 	ShutdownPreserveContainers() error
@@ -248,8 +249,9 @@ func (s *Server) Handler() http.Handler {
 // Shutdown stops all services while preserving sandbox containers for recovery.
 func (s *Server) Shutdown() error {
 	steps := []struct {
-		name string
-		run  func() error
+		name    string
+		visible func() bool
+		run     func() error
 	}{
 		{name: "Stopping WeChat service...", run: func() error {
 			if s.wechat != nil {
@@ -286,6 +288,8 @@ func (s *Server) Shutdown() error {
 				return s.sandbox.ShutdownPreserveContainers()
 			}
 			return nil
+		}, visible: func() bool {
+			return s.sandbox != nil && s.sandbox.HasActiveRuntime()
 		}},
 		{name: "Stopping cron scheduler...", run: func() error {
 			if s.cron != nil {
@@ -304,7 +308,10 @@ func (s *Server) Shutdown() error {
 	fmt.Fprintln(os.Stderr, "\n⏳ Shutdown")
 	fmt.Fprintln(os.Stderr, strings.Repeat("─", outputRuleWidth))
 	for _, step := range steps {
-		fmt.Fprintf(os.Stderr, "   %s\n", step.name)
+		visible := step.visible == nil || step.visible()
+		if visible {
+			fmt.Fprintf(os.Stderr, "   %s\n", step.name)
+		}
 		if err := step.run(); err != nil {
 			fmt.Fprintf(os.Stderr, "   %s failed: %v\n", step.name, err)
 			return err

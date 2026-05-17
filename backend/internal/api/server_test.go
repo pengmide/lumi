@@ -24,7 +24,7 @@ func TestResolveStaticPathPrefersFileOverDirectory(t *testing.T) {
 }
 
 func TestShutdownPreservesSandboxContainers(t *testing.T) {
-	fakeSandbox := &fakeSandboxManager{}
+	fakeSandbox := &fakeSandboxManager{hasActiveRuntime: true}
 	server := &Server{sandbox: fakeSandbox}
 
 	output := captureStderr(t, func() {
@@ -48,6 +48,26 @@ func TestShutdownPreservesSandboxContainers(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("shutdown output missing %q in:\n%s", want, output)
 		}
+	}
+}
+
+func TestShutdownClosesSandboxManagerWithoutActiveRuntimeSilently(t *testing.T) {
+	fakeSandbox := &fakeSandboxManager{}
+	server := &Server{sandbox: fakeSandbox}
+
+	output := captureStderr(t, func() {
+		if err := server.Shutdown(); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	})
+	if fakeSandbox.shutdownPreserveCalls != 1 {
+		t.Fatalf("ShutdownPreserveContainers calls = %d, want 1", fakeSandbox.shutdownPreserveCalls)
+	}
+	if strings.Contains(output, "Stopping sandbox manager (containers preserved)...") {
+		t.Fatalf("shutdown output should not mention inactive sandbox manager:\n%s", output)
+	}
+	if !strings.Contains(output, "   Shutdown complete.\n") {
+		t.Fatalf("shutdown output missing completion:\n%s", output)
 	}
 }
 
@@ -83,11 +103,16 @@ type fakeSandboxManager struct {
 	ensureState           sandbox.RuntimeState
 	ensureErr             *sandbox.RuntimeError
 	ensureCalls           int
+	hasActiveRuntime      bool
 }
 
 func (f *fakeSandboxManager) Ensure(context.Context, sandbox.EnsureOptions) (sandbox.RuntimeState, *sandbox.RuntimeError) {
 	f.ensureCalls++
 	return f.ensureState, f.ensureErr
+}
+
+func (f *fakeSandboxManager) HasActiveRuntime() bool {
+	return f.hasActiveRuntime
 }
 
 func (f *fakeSandboxManager) KeepAlive(config.WorkspaceConfig) {}

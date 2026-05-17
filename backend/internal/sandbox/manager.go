@@ -213,6 +213,10 @@ func (m *Manager) Status(workspace config.WorkspaceConfig) RuntimeState {
 	return *record
 }
 
+func (m *Manager) HasActiveRuntime() bool {
+	return len(m.activeRuntimeWorkspaceIDs()) > 0
+}
+
 func (m *Manager) KeepAlive(workspace config.WorkspaceConfig) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
