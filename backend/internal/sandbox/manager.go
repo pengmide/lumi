@@ -701,7 +701,7 @@ func (m *Manager) resolveCredentialMounts(workspaceID string) []sandboxdocker.Cr
 }
 
 func resolveCredentialMountsFromHome(home string, runtimeDir string) []sandboxdocker.CredentialMount {
-	mounts := make([]sandboxdocker.CredentialMount, 0, 2)
+	mounts := make([]sandboxdocker.CredentialMount, 0, 3)
 	seenTargets := make(map[string]bool, 2)
 	if source, ok := prepareWritableClaudeRoot(home, filepath.Join(runtimeDir, "claude-root")); ok {
 		seenTargets["/root"] = true
@@ -716,6 +716,14 @@ func resolveCredentialMountsFromHome(home string, runtimeDir string) []sandboxdo
 		mounts = append(mounts, sandboxdocker.CredentialMount{
 			Source:   source,
 			Target:   "/root/.codex",
+			ReadOnly: false,
+		})
+	}
+
+	if source, ok := prepareWritableQwenHome(home, filepath.Join(runtimeDir, "qwen")); ok {
+		mounts = append(mounts, sandboxdocker.CredentialMount{
+			Source:   source,
+			Target:   "/root/.qwen",
 			ReadOnly: false,
 		})
 	}
@@ -763,6 +771,23 @@ func prepareWritableCodexHome(home string, targetDir string) (string, bool) {
 
 	for _, name := range []string{"auth.json", "config.toml"} {
 		_ = copyCredentialFile(filepath.Join(home, ".codex", name), filepath.Join(targetDir, name))
+	}
+	return targetDir, true
+}
+
+func prepareWritableQwenHome(home string, targetDir string) (string, bool) {
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		return "", false
+	}
+
+	copied := false
+	for _, name := range []string{"settings.json", ".env"} {
+		if copyCredentialFile(filepath.Join(home, ".qwen", name), filepath.Join(targetDir, name)) {
+			copied = true
+		}
+	}
+	if !copied {
+		return "", false
 	}
 	return targetDir, true
 }

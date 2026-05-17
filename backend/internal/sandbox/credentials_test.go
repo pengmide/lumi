@@ -150,6 +150,68 @@ func TestResolveCredentialMountsCreatesWritableCodexHomeWithoutHostConfig(t *tes
 	}
 }
 
+func TestResolveCredentialMountsUsesWritableQwenHome(t *testing.T) {
+	home := t.TempDir()
+	runtimeDir := t.TempDir()
+
+	qwenDir := filepath.Join(home, ".qwen")
+	if err := os.MkdirAll(qwenDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(.qwen) error = %v", err)
+	}
+	settingsPath := filepath.Join(qwenDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(settings.json) error = %v", err)
+	}
+	envPath := filepath.Join(qwenDir, ".env")
+	if err := os.WriteFile(envPath, []byte("QWEN_TOKEN=test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.env) error = %v", err)
+	}
+
+	mounts := resolveCredentialMountsFromHome(home, runtimeDir)
+
+	qwenMount := findCredentialMount(mounts, "/root/.qwen")
+	if qwenMount == nil {
+		t.Fatalf("qwen home mount not found in %#v", mounts)
+	}
+	if qwenMount.ReadOnly {
+		t.Fatalf("qwen home mount ReadOnly = true, want false")
+	}
+	if qwenMount.Source == qwenDir {
+		t.Fatalf("qwen home mount source points at host dir, want runtime copy")
+	}
+
+	data, err := os.ReadFile(filepath.Join(qwenMount.Source, "settings.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(runtime settings copy) error = %v", err)
+	}
+	if string(data) != `{"theme":"dark"}` {
+		t.Fatalf("runtime qwen settings copy = %q", data)
+	}
+
+	data, err = os.ReadFile(filepath.Join(qwenMount.Source, ".env"))
+	if err != nil {
+		t.Fatalf("ReadFile(runtime .env copy) error = %v", err)
+	}
+	if string(data) != "QWEN_TOKEN=test\n" {
+		t.Fatalf("runtime qwen .env copy = %q", data)
+	}
+}
+
+func TestResolveCredentialMountsSkipsQwenHomeWithoutQwenFiles(t *testing.T) {
+	home := t.TempDir()
+	runtimeDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(home, ".qwen"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.qwen) error = %v", err)
+	}
+
+	mounts := resolveCredentialMountsFromHome(home, runtimeDir)
+
+	if mount := findCredentialMount(mounts, "/root/.qwen"); mount != nil {
+		t.Fatalf("qwen home mount = %#v, want nil", mount)
+	}
+}
+
 func TestSanitizeAgentsForCredentialMountsRemovesMountedClaudeCredentialEnv(t *testing.T) {
 	codexHome := t.TempDir()
 	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"token":"test"}`), 0o600); err != nil {
