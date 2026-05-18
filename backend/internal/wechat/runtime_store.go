@@ -26,7 +26,7 @@ type RuntimeStore struct {
 
 func NewRuntimeStore() *RuntimeStore {
 	return &RuntimeStore{
-		path: filepath.Join(wechatRootDir(), "runtime.json"),
+		path: filepath.Join(wechatActiveRootDir(), "runtime.json"),
 	}
 }
 

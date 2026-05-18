@@ -24,7 +24,7 @@ type RuntimeStore struct {
 
 func NewRuntimeStore() *RuntimeStore {
 	return &RuntimeStore{
-		path: filepath.Join(wecomRootDir(), "runtime.json"),
+		path: filepath.Join(wecomActiveRootDir(), "runtime.json"),
 	}
 }
 

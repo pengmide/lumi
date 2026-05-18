@@ -882,6 +882,7 @@ func sanitizeAgentsForCredentialMounts(agents []config.AgentConfig, mounts []san
 			if hasClaudeAuth {
 				sanitized[i].Env = withoutCredentialEnv(sanitized[i].Env, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 			}
+			sanitized[i].Env = withoutHostClaudeExecutableEnv(sanitized[i].Env)
 		case agentmode.BackendCodex:
 			// Keep explicit Codex API env from agent config. A mounted ~/.codex/auth.json
 			// can be ChatGPT auth, while OPENAI_API_KEY/OPENAI_BASE_URL may intentionally
@@ -889,6 +890,17 @@ func sanitizeAgentsForCredentialMounts(agents []config.AgentConfig, mounts []san
 		}
 	}
 	return sanitized
+}
+
+func withoutHostClaudeExecutableEnv(env map[string]string) map[string]string {
+	value := strings.TrimSpace(env["CLAUDE_CODE_EXECUTABLE"])
+	if value == "" || value == "/lumi/runtime/npm/bin/claude" || value == "claude" {
+		return env
+	}
+	if !filepath.IsAbs(value) {
+		return env
+	}
+	return withoutCredentialEnv(env, "CLAUDE_CODE_EXECUTABLE")
 }
 
 func hasCredentialTarget(mounts []sandboxdocker.CredentialMount, target string) bool {

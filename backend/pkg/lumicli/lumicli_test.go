@@ -3,6 +3,7 @@ package lumicli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,9 +274,13 @@ func TestPrepareRunUpsertsSandboxWorkspaceAndWecomConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareRun(sandbox) error = %v", err)
 	}
-	ws := cfg.FindWorkspace(SandboxWorkspaceID)
+	wantWorkspaceID, err := resolveSandboxWorkspaceID("wecom", "bot-123", workspace, "")
+	if err != nil {
+		t.Fatalf("resolveSandboxWorkspaceID() error = %v", err)
+	}
+	ws := cfg.FindWorkspace(wantWorkspaceID)
 	if ws == nil {
-		t.Fatal("workspace cli-sandbox not found")
+		t.Fatalf("workspace %s not found", wantWorkspaceID)
 	}
 	if ws.Kind != "sandbox" {
 		t.Fatalf("workspace kind = %q, want sandbox", ws.Kind)
@@ -286,15 +291,15 @@ func TestPrepareRunUpsertsSandboxWorkspaceAndWecomConfig(t *testing.T) {
 	if ws.IdleTimeoutSec != IMSandboxIdleTimeoutSec {
 		t.Fatalf("sandbox idle timeout = %d, want %d", ws.IdleTimeoutSec, IMSandboxIdleTimeoutSec)
 	}
-	if cfg.DefaultWorkspace != SandboxWorkspaceID {
-		t.Fatalf("default workspace = %q, want %q", cfg.DefaultWorkspace, SandboxWorkspaceID)
+	if cfg.DefaultWorkspace != wantWorkspaceID {
+		t.Fatalf("default workspace = %q, want %q", cfg.DefaultWorkspace, wantWorkspaceID)
 	}
 
-	wecomData, err := os.ReadFile(filepath.Join(home, ".lumi", "wecom", "config.json"))
+	wecomData, err := os.ReadFile(filepath.Join(home, ".lumi", "wecom", "instances", wantWorkspaceID, "config.json"))
 	if err != nil {
 		t.Fatalf("ReadFile(wecom) error = %v", err)
 	}
-	if !strings.Contains(string(wecomData), `"workspaceId": "cli-sandbox"`) {
+	if !strings.Contains(string(wecomData), fmt.Sprintf(`"workspaceId": "%s"`, wantWorkspaceID)) {
 		t.Fatalf("wecom config missing sandbox workspace: %s", string(wecomData))
 	}
 }
@@ -334,12 +339,77 @@ func TestPrepareRunUsesSandboxIdleTimeoutOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareRun(sandbox) error = %v", err)
 	}
-	ws := cfg.FindWorkspace(SandboxWorkspaceID)
+	wantWorkspaceID, err := resolveSandboxWorkspaceID("wecom", "bot-123", workspace, "")
+	if err != nil {
+		t.Fatalf("resolveSandboxWorkspaceID() error = %v", err)
+	}
+	ws := cfg.FindWorkspace(wantWorkspaceID)
 	if ws == nil {
-		t.Fatal("workspace cli-sandbox not found")
+		t.Fatalf("workspace %s not found", wantWorkspaceID)
 	}
 	if ws.IdleTimeoutSec != 7200 {
 		t.Fatalf("sandbox idle timeout = %d, want 7200", ws.IdleTimeoutSec)
+	}
+}
+
+func TestPrepareRunSandboxIDDerivationAndOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspaceA := filepath.Join(home, "workspace-a")
+	workspaceB := filepath.Join(home, "workspace-b")
+	if err := os.MkdirAll(workspaceA, 0o755); err != nil {
+		t.Fatalf("MkdirAll(workspaceA) error = %v", err)
+	}
+	if err := os.MkdirAll(workspaceB, 0o755); err != nil {
+		t.Fatalf("MkdirAll(workspaceB) error = %v", err)
+	}
+
+	state, err := ResolveConfigState("")
+	if err != nil {
+		t.Fatalf("ResolveConfigState() error = %v", err)
+	}
+	if err := EnsureConfigFile(state); err != nil {
+		t.Fatalf("EnsureConfigFile() error = %v", err)
+	}
+	state.Config.Agents = []config.AgentConfig{{ID: "claude", Name: "Claude Code", Command: "npx"}}
+	state.Config.DefaultAgent = "claude"
+	if err := saveConfig(state.Config, state.Path); err != nil {
+		t.Fatalf("saveConfig() error = %v", err)
+	}
+	state.HasAgents = true
+
+	cfg, _, err := PrepareRun(state, RunOptions{Workspace: workspaceA, Kind: "sandbox", AgentID: "claude", BotID: "bot-a", BotSecret: "secret"})
+	if err != nil {
+		t.Fatalf("PrepareRun(bot-a/workspace-a) error = %v", err)
+	}
+	firstID := cfg.DefaultWorkspace
+	cfg, _, err = PrepareRun(state, RunOptions{Workspace: workspaceA, Kind: "sandbox", AgentID: "claude", BotID: "bot-a", BotSecret: "secret"})
+	if err != nil {
+		t.Fatalf("PrepareRun(repeat) error = %v", err)
+	}
+	if cfg.DefaultWorkspace != firstID {
+		t.Fatalf("repeat workspace ID = %q, want %q", cfg.DefaultWorkspace, firstID)
+	}
+	cfg, _, err = PrepareRun(state, RunOptions{Workspace: workspaceA, Kind: "sandbox", AgentID: "claude", BotID: "bot-b", BotSecret: "secret"})
+	if err != nil {
+		t.Fatalf("PrepareRun(bot-b) error = %v", err)
+	}
+	if cfg.DefaultWorkspace == firstID {
+		t.Fatalf("different bot ID reused workspace ID %q", firstID)
+	}
+	cfg, _, err = PrepareRun(state, RunOptions{Workspace: workspaceB, Kind: "sandbox", AgentID: "claude", BotID: "bot-a", BotSecret: "secret"})
+	if err != nil {
+		t.Fatalf("PrepareRun(workspace-b) error = %v", err)
+	}
+	if cfg.DefaultWorkspace == firstID {
+		t.Fatalf("different workspace path reused workspace ID %q", firstID)
+	}
+	cfg, _, err = PrepareRun(state, RunOptions{Workspace: workspaceB, Kind: "sandbox", AgentID: "claude", BotID: "bot-b", BotSecret: "secret", SandboxID: "manual-a"})
+	if err != nil {
+		t.Fatalf("PrepareRun(manual) error = %v", err)
+	}
+	if cfg.DefaultWorkspace != "cli-sandbox-manual-a" {
+		t.Fatalf("manual workspace ID = %q, want cli-sandbox-manual-a", cfg.DefaultWorkspace)
 	}
 }
 
@@ -426,10 +496,14 @@ func TestPrepareWeChatRunSavesConfigAndWorkspace(t *testing.T) {
 	if resolved != workspace {
 		t.Fatalf("resolved workspace = %q, want %q", resolved, workspace)
 	}
-	if cfg.DefaultWorkspace != SandboxWorkspaceID {
-		t.Fatalf("default workspace = %q, want %q", cfg.DefaultWorkspace, SandboxWorkspaceID)
+	wantWorkspaceID, err := resolveSandboxWorkspaceID("wechat", "wx-bot", workspace, "")
+	if err != nil {
+		t.Fatalf("resolveSandboxWorkspaceID() error = %v", err)
 	}
-	ws := cfg.FindWorkspace(SandboxWorkspaceID)
+	if cfg.DefaultWorkspace != wantWorkspaceID {
+		t.Fatalf("default workspace = %q, want %q", cfg.DefaultWorkspace, wantWorkspaceID)
+	}
+	ws := cfg.FindWorkspace(wantWorkspaceID)
 	if ws == nil || ws.Kind != "sandbox" || ws.Agents[0] != "claude" {
 		t.Fatalf("sandbox workspace = %+v, want claude sandbox", ws)
 	}
@@ -437,7 +511,7 @@ func TestPrepareWeChatRunSavesConfigAndWorkspace(t *testing.T) {
 		t.Fatalf("public server URL = %q, want http://127.0.0.1:4455", cfg.PublicServerURL)
 	}
 
-	data, err := os.ReadFile(filepath.Join(home, ".lumi", "wechat", "config.json"))
+	data, err := os.ReadFile(filepath.Join(home, ".lumi", "wechat", "instances", wantWorkspaceID, "config.json"))
 	if err != nil {
 		t.Fatalf("ReadFile(wechat) error = %v", err)
 	}
@@ -446,7 +520,7 @@ func TestPrepareWeChatRunSavesConfigAndWorkspace(t *testing.T) {
 		t.Fatalf("Unmarshal(wechat) error = %v", err)
 	}
 	if !saved.Enabled || saved.LoginMode != "qr" || saved.AccountID != "wx-bot" || saved.BotToken != "bot-token" ||
-		saved.BaseURL != "https://wechat.test" || saved.WorkspaceID != SandboxWorkspaceID || saved.AgentID != "claude" {
+		saved.BaseURL != "https://wechat.test" || saved.WorkspaceID != wantWorkspaceID || saved.AgentID != "claude" {
 		t.Fatalf("wechat config = %+v, want saved QR credentials", saved)
 	}
 }

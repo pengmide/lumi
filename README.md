@@ -208,6 +208,8 @@ cd ../backend && go build -o lumi ./cmd/lumi
 
 `lumi wecom run` 不需要打开 Web 页面，但会启动本地 Lumi runtime，默认监听 `3000` 端口；如需避开端口冲突，可传 `--port` 或设置 `LUMI_PORT`。
 
+IM CLI 的 sandbox 模式会自动按 IM 身份和 workspace 绝对路径派生实例 ID，例如 `cli-sandbox-wechat-<hash>` 或 `cli-sandbox-wecom-<hash>`；相同账号/机器人和相同目录会复用实例，不同身份或目录会自动隔离。需要强制创建独立实例时，可传 `--sandbox-id <id>` 或设置 `LUMI_SANDBOX_ID`，最终实例 ID 为 `cli-sandbox-<id>`。
+
 ### 5. Linux 上的 Claude ACP 运行注意事项
 
 如果你在 Linux 服务器上通过 `@agentclientprotocol/claude-agent-acp@0.30.0` 使用 Claude，且系统自带的 `glibc` 版本较老（例如部分 CentOS 7 / RHEL 7 环境），SDK 默认下载的 Linux native `claude` binary 可能无法启动。

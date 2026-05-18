@@ -688,6 +688,7 @@ func runWeChatRun(args []string, stdout, stderr *os.File) error {
 	baseURL := fs.String("base-url", envOrDefault("LUMI_WECHAT_BASE_URL", ""), "WeChat login API base URL")
 	port := fs.String("port", envOrDefault("LUMI_PORT", "3000"), "Server port")
 	idleTimeoutSec := fs.Int("idle-timeout-sec", 0, "Sandbox idle timeout in seconds for IM CLI runs; defaults to 10 years")
+	sandboxID := fs.String("sandbox-id", envOrDefault("LUMI_SANDBOX_ID", ""), "Advanced sandbox instance ID override")
 	sandboxWarmup := fs.String("sandbox-warmup", envOrDefault("LUMI_SANDBOX_WARMUP", string(sandboxWarmupWait)), "Sandbox warmup mode for sandbox workspaces: wait, async, or off")
 	loginTimeoutSec := fs.Int("login-timeout-sec", 300, "WeChat QR login timeout in seconds")
 	forceLogin := fs.Bool("force-login", false, "Force WeChat QR login even when saved credentials exist")
@@ -735,9 +736,15 @@ func runWeChatRun(args []string, stdout, stderr *os.File) error {
 		BaseURL:        credentials.BaseURL,
 		Port:           *port,
 		IdleTimeoutSec: *idleTimeoutSec,
+		SandboxID:      *sandboxID,
 	})
 	if err != nil {
 		return err
+	}
+	resolvedWorkspaceID := cfg.DefaultWorkspace
+	if strings.TrimSpace(*kind) == "sandbox" {
+		restoreEnv := setProcessEnv("LUMI_WECHAT_INSTANCE_ID", resolvedWorkspaceID)
+		defer restoreEnv()
 	}
 
 	runtime, err := startServer(cfg, nil, *port)
@@ -748,6 +755,9 @@ func runWeChatRun(args []string, stdout, stderr *os.File) error {
 	fmt.Fprintf(stdout, "Config file: %s\n", state.Path)
 	fmt.Fprintf(stdout, "Workspace: %s\n", workspacePath)
 	fmt.Fprintf(stdout, "Workspace kind: %s\n", strings.TrimSpace(*kind))
+	if strings.TrimSpace(*kind) == "sandbox" {
+		fmt.Fprintf(stdout, "Sandbox instance: %s\n", resolvedWorkspaceID)
+	}
 	fmt.Fprintf(stdout, "Default agent: %s\n", *agentID)
 	fmt.Fprintf(stdout, "Workspace agents: %s\n", strings.Join(workspaceAgentIDs(cfg), ", "))
 	fmt.Fprintf(stdout, "Server: http://localhost:%s\n", runtime.Port())
@@ -762,7 +772,7 @@ func runWeChatRun(args []string, stdout, stderr *os.File) error {
 		if strings.TrimSpace(*kind) != "sandbox" {
 			return nil
 		}
-		return startSandboxWarmup(context.Background(), runtime, lumicli.SandboxWorkspaceID, warmupMode, stdout)
+		return startSandboxWarmup(context.Background(), runtime, resolvedWorkspaceID, warmupMode, stdout)
 	})
 }
 
@@ -883,6 +893,7 @@ func runWeComRun(args []string, stdout, stderr *os.File) error {
 	botSecret := fs.String("bot-secret", envOrDefault("LUMI_BOT_SECRET", ""), "WeCom bot secret")
 	port := fs.String("port", envOrDefault("LUMI_PORT", "3000"), "Server port")
 	idleTimeoutSec := fs.Int("idle-timeout-sec", 0, "Sandbox idle timeout in seconds for IM CLI runs; defaults to 10 years")
+	sandboxID := fs.String("sandbox-id", envOrDefault("LUMI_SANDBOX_ID", ""), "Advanced sandbox instance ID override")
 	sandboxWarmup := fs.String("sandbox-warmup", envOrDefault("LUMI_SANDBOX_WARMUP", string(sandboxWarmupWait)), "Sandbox warmup mode for sandbox workspaces: wait, async, or off")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -917,9 +928,15 @@ func runWeComRun(args []string, stdout, stderr *os.File) error {
 		BotSecret:      *botSecret,
 		Port:           *port,
 		IdleTimeoutSec: *idleTimeoutSec,
+		SandboxID:      *sandboxID,
 	})
 	if err != nil {
 		return err
+	}
+	resolvedWorkspaceID := cfg.DefaultWorkspace
+	if strings.TrimSpace(*kind) == "sandbox" {
+		restoreEnv := setProcessEnv("LUMI_WECOM_INSTANCE_ID", resolvedWorkspaceID)
+		defer restoreEnv()
 	}
 
 	runtime, err := startServer(cfg, nil, *port)
@@ -930,6 +947,9 @@ func runWeComRun(args []string, stdout, stderr *os.File) error {
 	fmt.Fprintf(stdout, "Config file: %s\n", state.Path)
 	fmt.Fprintf(stdout, "Workspace: %s\n", workspacePath)
 	fmt.Fprintf(stdout, "Workspace kind: %s\n", strings.TrimSpace(*kind))
+	if strings.TrimSpace(*kind) == "sandbox" {
+		fmt.Fprintf(stdout, "Sandbox instance: %s\n", resolvedWorkspaceID)
+	}
 	fmt.Fprintf(stdout, "Default agent: %s\n", *agentID)
 	fmt.Fprintf(stdout, "Workspace agents: %s\n", strings.Join(workspaceAgentIDs(cfg), ", "))
 	fmt.Fprintf(stdout, "Server: http://localhost:%s\n", runtime.Port())
@@ -940,7 +960,7 @@ func runWeComRun(args []string, stdout, stderr *os.File) error {
 		if strings.TrimSpace(*kind) != "sandbox" {
 			return nil
 		}
-		return startSandboxWarmup(context.Background(), runtime, lumicli.SandboxWorkspaceID, warmupMode, stdout)
+		return startSandboxWarmup(context.Background(), runtime, resolvedWorkspaceID, warmupMode, stdout)
 	})
 }
 
@@ -954,6 +974,18 @@ func parseSandboxWarmupMode(value string) (sandboxWarmupMode, error) {
 		return sandboxWarmupOff, nil
 	default:
 		return "", errors.New("sandbox warmup mode must be async, wait, or off")
+	}
+}
+
+func setProcessEnv(key, value string) func() {
+	previous, hadPrevious := os.LookupEnv(key)
+	_ = os.Setenv(key, value)
+	return func() {
+		if hadPrevious {
+			_ = os.Setenv(key, previous)
+			return
+		}
+		_ = os.Unsetenv(key)
 	}
 }
 
@@ -1134,12 +1166,12 @@ func printCronUsage(stdout *os.File, programName string) {
 
 func printWeComUsage(stdout *os.File, programName string) {
 	fmt.Fprintln(stdout, "Usage:")
-	fmt.Fprintf(stdout, "  %s wecom run --workspace <path> --kind local|sandbox --agent <id> --bot-id <id> --bot-secret <secret> [--idle-timeout-sec <seconds>] [flags]\n", programName)
+	fmt.Fprintf(stdout, "  %s wecom run --workspace <path> --kind local|sandbox --agent <id> --bot-id <id> --bot-secret <secret> [--sandbox-id <id>] [--idle-timeout-sec <seconds>] [flags]\n", programName)
 }
 
 func printWeChatUsage(stdout *os.File, programName string) {
 	fmt.Fprintln(stdout, "Usage:")
-	fmt.Fprintf(stdout, "  %s wechat run --workspace <path> --kind local|sandbox --agent <id> [--base-url <url>] [--force-login] [--login-timeout-sec <seconds>] [--idle-timeout-sec <seconds>] [flags]\n", programName)
+	fmt.Fprintf(stdout, "  %s wechat run --workspace <path> --kind local|sandbox --agent <id> [--base-url <url>] [--force-login] [--login-timeout-sec <seconds>] [--sandbox-id <id>] [--idle-timeout-sec <seconds>] [flags]\n", programName)
 }
 
 func printSandboxUsage(stdout *os.File, programName string) {

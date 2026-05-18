@@ -305,8 +305,14 @@ func TestWeChatRunSandboxWarmupWaitByDefault(t *testing.T) {
 	if fakeRuntime.warmupCalls != 1 {
 		t.Fatalf("warmup calls = %d, want 1", fakeRuntime.warmupCalls)
 	}
+	if !strings.HasPrefix(fakeRuntime.warmupWorkspaceID, "cli-sandbox-wechat-") {
+		t.Fatalf("warmup workspace ID = %q, want derived wechat sandbox ID", fakeRuntime.warmupWorkspaceID)
+	}
 	if fakeRuntime.statusCalls < 2 {
 		t.Fatalf("status calls = %d, want at least 2", fakeRuntime.statusCalls)
+	}
+	if fakeRuntime.statusWorkspaceID != fakeRuntime.warmupWorkspaceID {
+		t.Fatalf("status workspace ID = %q, want %q", fakeRuntime.statusWorkspaceID, fakeRuntime.warmupWorkspaceID)
 	}
 	for _, want := range []string{"Sandbox: warming up", "Sandbox: checking Docker", "Sandbox: preparing image", "Sandbox: ready"} {
 		if !stdoutContains(t, stdout, want) {
@@ -600,11 +606,13 @@ func createCLIConfigWithAgent(t *testing.T, home string) string {
 }
 
 type fakeServerRuntime struct {
-	port        string
-	warmupCalls int
-	statusCalls int
-	warmupState lumicli.SandboxWarmupState
-	statuses    []lumicli.SandboxWarmupState
+	port              string
+	warmupCalls       int
+	statusCalls       int
+	warmupWorkspaceID string
+	statusWorkspaceID string
+	warmupState       lumicli.SandboxWarmupState
+	statuses          []lumicli.SandboxWarmupState
 }
 
 func (r *fakeServerRuntime) ListenAndServe() error {
@@ -622,8 +630,9 @@ func (r *fakeServerRuntime) Port() string {
 	return r.port
 }
 
-func (r *fakeServerRuntime) WarmupSandbox(context.Context, string) (lumicli.SandboxWarmupState, error) {
+func (r *fakeServerRuntime) WarmupSandbox(_ context.Context, workspaceID string) (lumicli.SandboxWarmupState, error) {
 	r.warmupCalls++
+	r.warmupWorkspaceID = workspaceID
 	if r.warmupState.Status == "" {
 		r.warmupState = sandbox.RuntimeState{Status: sandbox.StatusRunning}
 	}
@@ -634,8 +643,9 @@ func (r *fakeServerRuntime) EnsureSandbox(context.Context, string) (lumicli.Sand
 	return r.WarmupSandbox(context.Background(), "")
 }
 
-func (r *fakeServerRuntime) SandboxStatus(string) (lumicli.SandboxWarmupState, error) {
+func (r *fakeServerRuntime) SandboxStatus(workspaceID string) (lumicli.SandboxWarmupState, error) {
 	r.statusCalls++
+	r.statusWorkspaceID = workspaceID
 	if len(r.statuses) > 0 {
 		state := r.statuses[0]
 		r.statuses = r.statuses[1:]

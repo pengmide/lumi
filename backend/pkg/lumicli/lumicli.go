@@ -2,6 +2,8 @@ package lumicli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -32,6 +34,7 @@ type RunOptions struct {
 	BotSecret      string
 	Port           string
 	IdleTimeoutSec int
+	SandboxID      string
 }
 
 type WeChatRunOptions struct {
@@ -45,6 +48,7 @@ type WeChatRunOptions struct {
 	BaseURL        string
 	Port           string
 	IdleTimeoutSec int
+	SandboxID      string
 }
 
 type ConfigState struct {
@@ -185,6 +189,9 @@ func PrepareRun(state *ConfigState, opts RunOptions) (*config.Config, string, er
 		AgentIDs:       opts.AgentIDs,
 		Port:           opts.Port,
 		IdleTimeoutSec: opts.IdleTimeoutSec,
+		Channel:        "wecom",
+		Identity:       opts.BotID,
+		SandboxID:      opts.SandboxID,
 	})
 	if err != nil {
 		return nil, "", err
@@ -207,7 +214,11 @@ func PrepareRun(state *ConfigState, opts RunOptions) (*config.Config, string, er
 	if strings.TrimSpace(wecomCfg.BotSecret) == "" {
 		return nil, "", errors.New("bot secret is required")
 	}
-	if err := wecom.NewConfigStore().Save(wecomCfg); err != nil {
+	store := wecom.NewConfigStore()
+	if workspaceKind(opts.Kind) == "sandbox" {
+		store = wecom.NewConfigStoreForInstance(workspaceID)
+	}
+	if err := store.Save(wecomCfg); err != nil {
 		return nil, "", err
 	}
 
@@ -222,6 +233,9 @@ func PrepareWeChatRun(state *ConfigState, opts WeChatRunOptions) (*config.Config
 		AgentIDs:       opts.AgentIDs,
 		Port:           opts.Port,
 		IdleTimeoutSec: opts.IdleTimeoutSec,
+		Channel:        "wechat",
+		Identity:       opts.AccountID,
+		SandboxID:      opts.SandboxID,
 	})
 	if err != nil {
 		return nil, "", err
@@ -242,7 +256,11 @@ func PrepareWeChatRun(state *ConfigState, opts WeChatRunOptions) (*config.Config
 	if strings.TrimSpace(wechatCfg.BotToken) == "" {
 		return nil, "", errors.New("bot token is required")
 	}
-	if err := wechat.NewConfigStore().Save(wechatCfg); err != nil {
+	store := wechat.NewConfigStore()
+	if workspaceKind(opts.Kind) == "sandbox" {
+		store = wechat.NewConfigStoreForInstance(workspaceID)
+	}
+	if err := store.Save(wechatCfg); err != nil {
 		return nil, "", err
 	}
 
@@ -256,6 +274,9 @@ type imRunWorkspaceOptions struct {
 	AgentIDs       []string
 	Port           string
 	IdleTimeoutSec int
+	Channel        string
+	Identity       string
+	SandboxID      string
 }
 
 func prepareIMRunWorkspace(state *ConfigState, opts imRunWorkspaceOptions) (*config.Config, string, string, string, error) {
@@ -278,10 +299,7 @@ func prepareIMRunWorkspace(state *ConfigState, opts imRunWorkspaceOptions) (*con
 	if !info.IsDir() {
 		return nil, "", "", "", errors.New("workspace must be a directory")
 	}
-	kind := strings.TrimSpace(opts.Kind)
-	if kind == "" {
-		kind = "local"
-	}
+	kind := workspaceKind(opts.Kind)
 	if kind != "local" && kind != "sandbox" {
 		return nil, "", "", "", errors.New("kind must be local or sandbox")
 	}
@@ -308,7 +326,10 @@ func prepareIMRunWorkspace(state *ConfigState, opts imRunWorkspaceOptions) (*con
 	workspaceID := WorkspaceID
 	workspaceKind := "local"
 	if kind == "sandbox" {
-		workspaceID = SandboxWorkspaceID
+		workspaceID, err = resolveSandboxWorkspaceID(opts.Channel, opts.Identity, workspacePath, opts.SandboxID)
+		if err != nil {
+			return nil, "", "", "", err
+		}
 		workspaceKind = "sandbox"
 	}
 	workspace := config.WorkspaceConfig{
@@ -343,6 +364,49 @@ func prepareIMRunWorkspace(state *ConfigState, opts imRunWorkspaceOptions) (*con
 	}
 
 	return cfg, workspacePath, workspaceID, agentID, nil
+}
+
+func workspaceKind(value string) string {
+	kind := strings.TrimSpace(value)
+	if kind == "" {
+		return "local"
+	}
+	return kind
+}
+
+func resolveSandboxWorkspaceID(channel, identity, workspacePath, sandboxID string) (string, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID != "" {
+		if err := validateSandboxID(sandboxID); err != nil {
+			return "", err
+		}
+		return SandboxWorkspaceID + "-" + sandboxID, nil
+	}
+
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	identity = strings.TrimSpace(identity)
+	if channel != "wechat" && channel != "wecom" {
+		return "", errors.New("sandbox channel must be wechat or wecom")
+	}
+	if identity == "" {
+		return "", errors.New("sandbox identity is required")
+	}
+	seed := channel + "\x00" + identity + "\x00" + workspacePath
+	sum := sha256.Sum256([]byte(seed))
+	return SandboxWorkspaceID + "-" + channel + "-" + hex.EncodeToString(sum[:])[:8], nil
+}
+
+func validateSandboxID(value string) error {
+	if value == "." || value == ".." {
+		return errors.New("sandbox id may not be . or ..")
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return errors.New("sandbox id may only contain letters, numbers, dots, underscores, and hyphens")
+	}
+	return nil
 }
 
 func resolveIMWorkspaceAgents(cfg *config.Config, requested []string, defaultAgent string) ([]string, error) {

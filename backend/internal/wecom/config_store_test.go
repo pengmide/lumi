@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -59,6 +60,23 @@ func TestConfigStoreDefaultsAndPermissions(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Fatalf("config mode = %#o, want %#o", info.Mode().Perm(), os.FileMode(0o600))
 		}
+	}
+}
+
+func TestStoresUseConfiguredInstanceRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LUMI_WECOM_INSTANCE_ID", "cli-sandbox-wecom-test")
+
+	wantRoot := filepath.Join(home, ".lumi", "wecom", "instances", "cli-sandbox-wecom-test")
+	if got := NewConfigStore().path; got != filepath.Join(wantRoot, "config.json") {
+		t.Fatalf("config path = %q, want instance path", got)
+	}
+	if got := NewRuntimeStore().path; got != filepath.Join(wantRoot, "runtime.json") {
+		t.Fatalf("runtime path = %q, want instance path", got)
+	}
+	if got := NewConversationStore().baseDir; got != filepath.Join(wantRoot, "sessions") {
+		t.Fatalf("conversation dir = %q, want instance path", got)
 	}
 }
 

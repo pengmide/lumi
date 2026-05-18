@@ -224,8 +224,9 @@ func TestSanitizeAgentsForCredentialMountsRemovesMountedClaudeCredentialEnv(t *t
 			Command: "npx",
 			Args:    []string{"@agentclientprotocol/claude-agent-acp@0.30.0"},
 			Env: map[string]string{
-				"ANTHROPIC_AUTH_TOKEN": "bad-token",
-				"ANTHROPIC_BASE_URL":   "https://example.test",
+				"ANTHROPIC_AUTH_TOKEN":   "bad-token",
+				"ANTHROPIC_BASE_URL":     "https://example.test",
+				"CLAUDE_CODE_EXECUTABLE": "/usr/local/bin/claude",
 			},
 		},
 		{
@@ -249,6 +250,9 @@ func TestSanitizeAgentsForCredentialMountsRemovesMountedClaudeCredentialEnv(t *t
 	}
 	if got[0].Env["ANTHROPIC_BASE_URL"] == "" {
 		t.Fatalf("claude base URL env should be preserved")
+	}
+	if _, ok := got[0].Env["CLAUDE_CODE_EXECUTABLE"]; ok {
+		t.Fatalf("host claude executable env was not removed")
 	}
 	if got[1].Env["OPENAI_API_KEY"] != "bad-token" {
 		t.Fatalf("codex API key should be preserved")

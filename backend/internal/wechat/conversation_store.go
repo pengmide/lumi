@@ -16,7 +16,7 @@ type ConversationStore struct {
 
 func NewConversationStore() *ConversationStore {
 	return &ConversationStore{
-		baseDir: filepath.Join(wechatRootDir(), "sessions"),
+		baseDir: filepath.Join(wechatActiveRootDir(), "sessions"),
 	}
 }
 

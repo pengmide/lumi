@@ -39,7 +39,13 @@ type ConfigStore struct {
 
 func NewConfigStore() *ConfigStore {
 	return &ConfigStore{
-		path: filepath.Join(wechatRootDir(), "config.json"),
+		path: filepath.Join(wechatActiveRootDir(), "config.json"),
+	}
+}
+
+func NewConfigStoreForInstance(instanceID string) *ConfigStore {
+	return &ConfigStore{
+		path: filepath.Join(wechatInstanceRootDir(instanceID), "config.json"),
 	}
 }
 
@@ -122,6 +128,17 @@ func wechatRootDir() string {
 		home = "."
 	}
 	return filepath.Join(home, ".lumi", "wechat")
+}
+
+func wechatActiveRootDir() string {
+	if instanceID := strings.TrimSpace(os.Getenv("LUMI_WECHAT_INSTANCE_ID")); instanceID != "" {
+		return wechatInstanceRootDir(instanceID)
+	}
+	return wechatRootDir()
+}
+
+func wechatInstanceRootDir(instanceID string) string {
+	return filepath.Join(wechatRootDir(), "instances", strings.TrimSpace(instanceID))
 }
 
 func ensurePrivateDir(dir string) error {

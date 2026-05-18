@@ -50,7 +50,13 @@ type ConfigStore struct {
 
 func NewConfigStore() *ConfigStore {
 	return &ConfigStore{
-		path: filepath.Join(wecomRootDir(), "config.json"),
+		path: filepath.Join(wecomActiveRootDir(), "config.json"),
+	}
+}
+
+func NewConfigStoreForInstance(instanceID string) *ConfigStore {
+	return &ConfigStore{
+		path: filepath.Join(wecomInstanceRootDir(instanceID), "config.json"),
 	}
 }
 
@@ -146,6 +152,17 @@ func wecomRootDir() string {
 		home = "."
 	}
 	return filepath.Join(home, ".lumi", "wecom")
+}
+
+func wecomActiveRootDir() string {
+	if instanceID := strings.TrimSpace(os.Getenv("LUMI_WECOM_INSTANCE_ID")); instanceID != "" {
+		return wecomInstanceRootDir(instanceID)
+	}
+	return wecomRootDir()
+}
+
+func wecomInstanceRootDir(instanceID string) string {
+	return filepath.Join(wecomRootDir(), "instances", strings.TrimSpace(instanceID))
 }
 
 func ensurePrivateDir(dir string) error {
